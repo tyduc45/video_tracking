@@ -2,12 +2,16 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.mp4
+*.mov
+*.avi
+*.wmv
+*.flv
 
+videos/
 # C extensions
 *.so
 
-# Ignore everything by default
-*
 !src/
 !model/
 !.gitignore

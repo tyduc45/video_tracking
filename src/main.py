@@ -11,8 +11,8 @@ def main():
     project_root = os.path.dirname(script_dir)
     
     video_paths = [
-        os.path.join(project_root, "videos", "video0.mp4"),
-        os.path.join(project_root, "videos", "video1.mp4")
+        os.path.join(project_root, "videos", "video00.mp4"),
+        os.path.join(project_root, "videos", "video01.mp4")
     ]
     model_path = os.path.join(project_root, "model", "yolo12n.pt")
     save_path = os.path.join(project_root, "result")
@@ -23,7 +23,7 @@ def main():
 
     stop_event = threading.Event()
 
-    handler = Video_Handler(capacity=1000, path_list=video_paths,stop_event=stop_event)
+    handler = Video_Handler(capacity=10000, path_list=video_paths,stop_event=stop_event)
     frame_queue = handler.getbuffer()
 
     # 3. 初始化推理器 (消费者)

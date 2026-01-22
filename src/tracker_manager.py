@@ -70,10 +70,11 @@ class SingleVideoTracker:
         
         返回值：如果返回列表，表示有多个帧已排序完成
         """
+        # 初始化tracker（在锁外进行，避免在持有锁的情况下进行耗时操作）
+        if model_path and not self.tracker_initialized:
+            self._init_tracker(model_path)
+        
         with self.lock:
-            if model_path and not self.tracker_initialized:
-                self._init_tracker(model_path)
-            
             # 第一步：根据帧编号判断
             if frame_data.frame_id != self.counter:
                 # 帧乱序，进入优先队列

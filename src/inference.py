@@ -7,6 +7,7 @@ from ultralytics import YOLO
 import sys
 from io import StringIO
 from tracker_manager import TrackerManager, FrameData
+from collections import defaultdict
 
 class BatchInferencer(threading.Thread):
     def __init__(self, queue, batch_size, model_path, save_path, stop_event, video_paths):
@@ -238,14 +239,21 @@ class BatchInferencer(threading.Thread):
 
     def _save_batch_results(self, results):
         """
-        缓存追踪结果到内存，不保存中间帧图片
+        保存追踪结果到磁盘，同时维护内存缓冲区用于最后的视频生成和删除
+        使用异步线程处理磁盘写入，防止阻塞消费者线程
         
         Args:
             results: FrameData 对象列表，包含追踪信息
         """
         # 初始化缓存字典（按视频ID分组）
         if not hasattr(self, 'frame_buffer'):
-            self.frame_buffer = {}
+            self.frame_buffer = {}  # 用于记录帧数据，后续生成视频
+        
+        if not hasattr(self, 'frame_files'):
+            self.frame_files = defaultdict(list)  # {video_id: [file_paths]}
+        
+        if not hasattr(self, 'disk_write_lock'):
+            self.disk_write_lock = threading.Lock()  # 保护磁盘写入操作
         
         for frame_data in results:
             try:
@@ -262,16 +270,50 @@ class BatchInferencer(threading.Thread):
                 else:
                     annotated_frame = frame_data.frame
                 
-                # 缓存帧数据（仅保存在内存）
+                # 先保存到内存（快速操作）
                 self.frame_buffer[video_id][frame_data.frame_id] = annotated_frame
+                
+                # 异步保存到磁盘（使用后台线程，不阻塞主流程）
+                write_thread = threading.Thread(
+                    target=self._async_save_frame,
+                    args=(annotated_frame, video_id, frame_data.frame_id, frame_data.path),
+                    daemon=True
+                )
+                write_thread.start()
                 
                 # 定期输出统计信息
                 total_frames = sum(len(frames) for frames in self.frame_buffer.values())
                 if total_frames % 50 == 0:
-                    print(f"[Consumer] 已缓存 {total_frames} 帧到内存")
+                    print(f"[Consumer] 已缓存 {total_frames} 帧（异步保存到磁盘）")
                     
             except Exception as e:
                 print(f"[Consumer] 缓存帧 {frame_data.frame_id} 失败: {e}")
+    
+    def _async_save_frame(self, frame, video_id, frame_id, frame_path):
+        """
+        异步保存单个帧到磁盘
+        """
+        try:
+            with self.disk_write_lock:  # 防止并发写入冲突
+                ts = int(time.time() * 1000)
+                filename = os.path.basename(frame_path)
+                save_name = os.path.join(
+                    self.save_path, 
+                    f"tracked_{ts}_{video_id}_f{frame_id}_{filename}.jpg"
+                )
+                
+                import cv2
+                cv2.imwrite(save_name, frame)
+                
+                # 记录文件路径（用于最后删除）
+                if video_id in self.frame_files:
+                    self.frame_files[video_id].append(save_name)
+                else:
+                    self.frame_files[video_id] = [save_name]
+                
+        except Exception as e:
+            print(f"[Consumer] 异步保存帧 {frame_id} 失败: {e}")
+
 
     def _final_cleanup(self):
         """最后清理，从内存缓冲区生成视频"""
@@ -283,6 +325,11 @@ class BatchInferencer(threading.Thread):
                 self.queue.get_nowait()
             except queue.Empty:
                 break
+        
+        # 等待异步磁盘写入完成（给后台线程1秒时间）
+        print("[Consumer] 等待异步磁盘写入完成...")
+        import time as time_module
+        time_module.sleep(1)
         
         # 刷新追踪器缓冲区，确保所有乱序帧都被输出
         remaining_frames = self.tracker_manager.flush_all_buffers(self.model_path)
@@ -298,11 +345,22 @@ class BatchInferencer(threading.Thread):
     
     def _generate_videos_from_buffer(self):
         """
-        从内存缓冲区生成视频文件
+        从内存缓冲区生成视频文件，然后删除所有中间帧文件
         """
         import cv2
         
-        for video_id, frames_dict in self.frame_buffer.items():
+        # 创建快照以避免迭代过程中字典大小改变的错误
+        # 必须在持有锁的情况下创建快照
+        with self.disk_write_lock:
+            video_ids_to_process = list(self.frame_buffer.keys())
+        
+        for video_id in video_ids_to_process:
+            # 每次获取一个视频的帧数据副本（持有锁）
+            with self.disk_write_lock:
+                if video_id not in self.frame_buffer:
+                    continue  # 该视频已被处理过
+                frames_dict = self.frame_buffer[video_id].copy()
+            
             if not frames_dict:
                 continue
             
@@ -328,8 +386,25 @@ class BatchInferencer(threading.Thread):
                 writer.release()
                 print(f"[VideoGen] 生成视频: {output_path} ({frame_count} 帧)")
                 
-                # 清空内存中的帧数据
-                del self.frame_buffer[video_id]
+                # 删除所有对应的中间帧文件
+                if video_id in self.frame_files:
+                    deleted_count = 0
+                    for frame_file in self.frame_files[video_id]:
+                        try:
+                            if os.path.exists(frame_file):
+                                os.remove(frame_file)
+                                deleted_count += 1
+                        except Exception as e:
+                            print(f"[VideoGen] 删除文件失败 {frame_file}: {e}")
+                    
+                    print(f"[VideoGen] 已删除 {deleted_count} 个中间帧文件")
+                
+                # 清空内存中的帧数据（持有锁）
+                with self.disk_write_lock:
+                    if video_id in self.frame_buffer:
+                        del self.frame_buffer[video_id]
+                    if video_id in self.frame_files:
+                        del self.frame_files[video_id]
                 
             except Exception as e:
                 print(f"[VideoGen] 生成 {video_id} 的视频失败: {e}")

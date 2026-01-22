@@ -6,9 +6,10 @@ import threading
 from ultralytics import YOLO
 import sys
 from io import StringIO
+from tracker_manager import TrackerManager, FrameData
 
 class BatchInferencer(threading.Thread):
-    def __init__(self, queue, batch_size, model_path, save_path, stop_event):
+    def __init__(self, queue, batch_size, model_path, save_path, stop_event, video_paths):
         super().__init__(name="InferenceThread")
         self.daemon = True  # 设置为守护线程，主程序退出时自动杀死
         self.queue = queue
@@ -16,6 +17,11 @@ class BatchInferencer(threading.Thread):
         self.isRunning = True
         self.stop_event = stop_event
         self.save_path = save_path
+        self.video_paths = video_paths
+        self.model_path = model_path  # 保存模型路径供后续使用
+        
+        # 初始化追踪器管理器
+        self.tracker_manager = TrackerManager(video_paths)
         
         # 1. 在加载前，先处理模型导出逻辑
         self.model = self._setup_model_with_history(model_path, task_type="detect")
@@ -89,114 +95,244 @@ class BatchInferencer(threading.Thread):
                     print(f"[Cleanup] 无法删除 {file_p}: {e}")
 
     def run(self):
+        """主循环：负责高层逻辑调度"""
         try:
-            # 确保保存目录存在
-            if not os.path.exists(self.save_path):
-                os.makedirs(self.save_path, exist_ok=True)
-                print(f"[Consumer] 创建保存目录: {self.save_path}")
+            self._ensure_dir_exists()
             
             while self.isRunning:
-                batch_frames, batch_paths = [], []
-                stop_signal_received = False
-                first_wait = True
-
-                # 2. 组装 Batch 逻辑 - 最多收集16帧，或在超时后进行推理
-                for frame_idx in range(self.batch_size):
-                    try:
-                        # 第一帧需要等待（最多1秒），后续帧使用较短的超时（0.1秒）
-                        timeout = 1.0 if first_wait else 0.1
-                        data = self.queue.get(timeout=timeout)
-                        first_wait = False
-                        
-                        if data is None: # 收到停止信号
-                            stop_signal_received = True
-                            self.isRunning = False
-                            break
-                        
-                        frame, path = data
-                        if frame is None: continue
-                        
-                        batch_frames.append(frame)
-                        batch_paths.append(path)
-                    except queue.Empty:
-                        # 检查是否收到停止信号
-                        if self.stop_event.is_set():
-                            stop_signal_received = True
-                            self.isRunning = False
-                            break
-                        
-                        # 队列为空，如果已有帧则进行推理，否则继续等待
-                        if batch_frames:
-                            print(f"[Consumer] 队列超时，触发推理 ({len(batch_frames)} 帧)")
-                            break
-                        elif stop_signal_received:
-                            break
-                        else:
-                            continue
-
-                # 即使收到停止信号也处理已收集的帧
+                # 1. 收集数据
+                batch_frames, batch_paths, batch_frame_ids, stop_signal = self._collect_batch()
+                
                 if not batch_frames:
-                    if stop_signal_received:
-                        break
+                    if stop_signal: break
                     continue
 
-                # 3. 动态适配推理
+                # 2. 执行推理
                 actual_num = len(batch_frames)
-                # 如果是静态 Engine，这里仍需 Padding，动态则不需要，为稳妥起见保留补齐
-                while len(batch_frames) < self.batch_size:
-                    batch_frames.append(batch_frames[-1])
-
-                try:
-                    # 再次检查是否应该停止
-                    if self.stop_event.is_set():
-                        break
+                results = self._execute_inference(batch_frames)
+                
+                if results:
+                    # 3. 构建 FrameData 对象并送入追踪管理器
+                    tracked_results = self._process_with_tracking(
+                        results, batch_paths, batch_frame_ids, batch_frames
+                    )
                     
-                    print(f"[Consumer] 处理批次: {actual_num} 帧 (补齐至 {len(batch_frames)})")
-                    
-                    # 捕获verbose输出
-                    old_stdout = sys.stdout
-                    sys.stdout = StringIO()
-                    
-                    try:
-                        results = self.model.predict(
-                            source=batch_frames, conf=0.25, device=0, verbose=True
-                        )
-                        verbose_output = sys.stdout.getvalue()
-                    finally:
-                        sys.stdout = old_stdout
-                    
-                    # 直接输出verbose结果
-                    if verbose_output.strip():
-                        print(verbose_output.strip())
-                    
-                    # 4. 适配 16 个图片的批处理保存
-                    for i in range(actual_num):
-                        orig_path = batch_paths[i]
-                        # 仅提取文件名防止 Windows 路径错误
-                        filename = os.path.basename(orig_path)
-                        save_name = f"{self.save_path}/res_{int(time.time()*1000)}_{i}_{filename}.jpg"
-                        try:
-                            results[i].save(filename=save_name)
-                        except Exception as save_err:
-                            print(f"[Consumer] 保存失败 {save_name}: {save_err}")
-                    
-                    if stop_signal_received:
-                        break
-                        
-                except Exception as e:
-                    print(f"[Consumer] 推理错误: {e}")
-                    self.stop_event.set()
-                    # 不再 raise，直接退出循环
+                    # 4. 保存结果
+                    self._save_batch_results(tracked_results)
+                
+                if stop_signal or self.stop_event.is_set():
                     break
         finally:
-            # 5. 最终清理内存，解救生产者
-            print("[Consumer] 清理队列并退出推理线程...")
-            while not self.queue.empty():
-                try:
-                    self.queue.get_nowait()
-                except:
+            self._final_cleanup()
+
+    def _ensure_dir_exists(self):
+        """确保保存目录存在"""
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path, exist_ok=True)
+            print(f"[Consumer] 创建目录: {self.save_path}")
+
+    def _collect_batch(self):
+        """
+        核心组装逻辑：从队列获取数据
+        返回: (frames_list, paths_list, frame_ids_list, stop_signal_received)
+        """
+        frames, paths, frame_ids = [], [], []
+        stop_signal = False
+        
+        for i in range(self.batch_size):
+            try:
+                # 第一帧给 1.0s 超时，后续帧给 0.1s 实现快速滑动
+                timeout = 1.0 if i == 0 else 0.1
+                data = self.queue.get(timeout=timeout)
+                
+                if data is None: # 收到结束标志
+                    stop_signal = True
+                    self.isRunning = False
                     break
-            print("[Consumer] 推理线程已退出")
+                
+                # 现在数据包含 (frame, path, frame_id)
+                frames.append(data[0])
+                paths.append(data[1])
+                frame_ids.append(data[2])
+                
+            except queue.Empty:
+                if self.stop_event.is_set():
+                    stop_signal = True
+                # 如果队列空且有数据，继续处理当前批次
+                # 否则等待新数据
+                if not frames:
+                    continue
+                break # 有数据时直接处理，不再等待
+                
+        return frames, paths, frame_ids, stop_signal
+
+    def _execute_inference(self, frames):
+        """执行推理，处理补齐逻辑"""
+        try:
+            # 补齐到固定 Batch Size 以适配 TensorRT Engine
+            actual_num = len(frames)
+            while len(frames) < self.batch_size:
+                frames.append(frames[-1])
+
+            return self.model.predict(
+                source=frames, conf=0.25, device=0, verbose=False
+            )
+        except Exception as e:
+            print(f"[Consumer] 推理崩溃: {e}")
+            self.stop_event.set()
+            return None
+
+    def _process_with_tracking(self, results, batch_paths, batch_frame_ids, batch_frames):
+        """
+        处理推理结果，通过追踪管理器进行时序同步和追踪
+        
+        Args:
+            results: YOLO 推理结果
+            batch_paths: 对应的视频路径列表
+            batch_frame_ids: 对应的帧编号列表
+            batch_frames: 原始帧图像
+            
+        Returns:
+            已排序并追踪的帧数据列表
+        """
+        tracked_results = []
+        
+        for idx, (result, path, frame_id, frame) in enumerate(zip(results, batch_paths, batch_frame_ids, batch_frames)):
+            try:
+                # 获取视频 ID
+                video_id = self.tracker_manager.get_video_id(path)
+                if not video_id:
+                    print(f"[Tracking] 警告：无法识别视频路径 {path}")
+                    continue
+                
+                # 创建 FrameData 对象
+                frame_data = FrameData(
+                    frame=frame,
+                    path=path,
+                    video_id=video_id,
+                    frame_id=frame_id,
+                    detections=result
+                )
+                
+                # 通过追踪管理器处理（乱序恢复）
+                ready_frames = self.tracker_manager.process_frame(frame_data)
+                
+                # 对已排序完成的帧进行追踪
+                if ready_frames:
+                    tracked_frames = self.tracker_manager.track_frames(
+                        ready_frames, 
+                        model_path=self.model_path  # 传递正确的模型路径
+                    )
+                    tracked_results.extend(tracked_frames)
+                    
+                    # 定期打印追踪状态
+                    if len(tracked_results) % 10 == 0:
+                        self.tracker_manager.print_status()
+                        
+            except Exception as e:
+                print(f"[Tracking] 处理帧 {frame_id} 失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        return tracked_results
+
+    def _save_batch_results(self, results):
+        """
+        缓存追踪结果到内存，不保存中间帧图片
+        
+        Args:
+            results: FrameData 对象列表，包含追踪信息
+        """
+        # 初始化缓存字典（按视频ID分组）
+        if not hasattr(self, 'frame_buffer'):
+            self.frame_buffer = {}
+        
+        for frame_data in results:
+            try:
+                video_id = frame_data.video_id
+                
+                # 初始化该视频的缓冲区
+                if video_id not in self.frame_buffer:
+                    self.frame_buffer[video_id] = {}
+                
+                # 获取注释后的帧
+                if frame_data.detections:
+                    # 绘制检测框和追踪 ID
+                    annotated_frame = frame_data.detections.plot()
+                else:
+                    annotated_frame = frame_data.frame
+                
+                # 缓存帧数据（仅保存在内存）
+                self.frame_buffer[video_id][frame_data.frame_id] = annotated_frame
+                
+                # 定期输出统计信息
+                total_frames = sum(len(frames) for frames in self.frame_buffer.values())
+                if total_frames % 50 == 0:
+                    print(f"[Consumer] 已缓存 {total_frames} 帧到内存")
+                    
+            except Exception as e:
+                print(f"[Consumer] 缓存帧 {frame_data.frame_id} 失败: {e}")
+
+    def _final_cleanup(self):
+        """最后清理，从内存缓冲区生成视频"""
+        print("[Consumer] 正在执行最终清理...")
+        
+        # 先清空队列
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # 刷新追踪器缓冲区，确保所有乱序帧都被输出
+        remaining_frames = self.tracker_manager.flush_all_buffers(self.model_path)
+        if remaining_frames:
+            print(f"[Consumer] 从缓冲区刷新出 {len(remaining_frames)} 帧")
+            self._save_batch_results(remaining_frames)
+        
+        # 生成视频
+        if hasattr(self, 'frame_buffer') and self.frame_buffer:
+            self._generate_videos_from_buffer()
+        
+        print("[Consumer] 推理线程安全退出")
+    
+    def _generate_videos_from_buffer(self):
+        """
+        从内存缓冲区生成视频文件
+        """
+        import cv2
+        
+        for video_id, frames_dict in self.frame_buffer.items():
+            if not frames_dict:
+                continue
+            
+            try:
+                # 按帧编号排序
+                sorted_frame_ids = sorted(frames_dict.keys())
+                
+                # 获取第一帧以确定分辨率
+                first_frame = frames_dict[sorted_frame_ids[0]]
+                height, width = first_frame.shape[:2]
+                
+                # 创建视频写入器
+                output_path = os.path.join(self.save_path, f"tracked_{video_id}.mp4")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(output_path, fourcc, 30, (width, height))
+                
+                frame_count = 0
+                for frame_id in sorted_frame_ids:
+                    frame = frames_dict[frame_id]
+                    writer.write(frame)
+                    frame_count += 1
+                
+                writer.release()
+                print(f"[VideoGen] 生成视频: {output_path} ({frame_count} 帧)")
+                
+                # 清空内存中的帧数据
+                del self.frame_buffer[video_id]
+                
+            except Exception as e:
+                print(f"[VideoGen] 生成 {video_id} 的视频失败: {e}")
 
     def stop(self):
         self.isRunning = False

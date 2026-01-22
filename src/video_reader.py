@@ -5,12 +5,14 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 import threading
 class Video_Handler:
-    def __init__(self, capacity, path_list,stop_event):
+    def __init__(self, capacity, path_list, stop_event):
         self.__buffer = queue.Queue(maxsize=1000)
         self.capacity = capacity
         self.path_list = path_list
         self.stop_event = stop_event
         self.pool = ThreadPoolExecutor(max_workers=len(path_list))
+        # 为每个视频源维护一个帧计数器
+        self.frame_counters = {path: 0 for path in path_list}
 
     def __clear_buffer(self):
         while not self.__buffer.empty():
@@ -31,8 +33,14 @@ class Video_Handler:
                 ret, frame = cap.read()
                 if not ret:
                     break 
+                
+                # 为帧分配编号（1-based）
+                self.frame_counters[path] += 1
+                frame_id = self.frame_counters[path]
+                
                 try:
-                    self.__buffer.put((frame, path), timeout=0.5)
+                    # 将帧数据、路径和帧编号一起放入队列
+                    self.__buffer.put((frame, path, frame_id), timeout=0.5)
                 except queue.Full:
                     continue # 队列满则重试
                 

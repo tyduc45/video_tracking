@@ -27,13 +27,14 @@ def main():
     frame_queue = handler.getbuffer()
 
     # 3. 初始化推理器 (消费者)
-    # 将同一个 queue 传给推理器
+    # 将同一个 queue 传给推理器，并传递视频路径用于追踪器初始化
     inferencer = BatchInferencer(
         queue=frame_queue, 
         batch_size=16, 
         model_path=model_path,
         save_path=save_path,
-        stop_event=stop_event
+        stop_event=stop_event,
+        video_paths=video_paths  # 传递视频路径列表给追踪管理器
     )
 
     print("--- 启动视频读取与推理流水线 ---")
@@ -42,8 +43,9 @@ def main():
     print(f"[Main] 结果保存路径: {save_path}")
     
     # 4. 启动线程
-    handler.read_video()  # 启动线程池读取视频
     inferencer.start()    # 启动推理线程
+    handler.read_video()  # 启动线程池读取视频
+    
 
     try:
         # 等待视频读取完成（等待线程池）

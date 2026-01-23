@@ -17,7 +17,7 @@ class Config:
     model_path: str = ""                                 # 完整路径（会自动组装）
     use_engine: bool = True                              # 优先使用engine文件
     use_half: bool = True                                # 使用半精度
-    model_type: str = "yolov8"                           # yolov8, yolov5等
+    model_type: str = "yolov12"                          # yolov8, yolov12等
     
     # 推理配置
     device: str = "cpu"                                  # cuda或cpu（优先使用cuda）

@@ -4,7 +4,7 @@
   "model_path": "../model\\yolo12n.engine",
   "use_engine": true,
   "use_half": true,
-  "model_type": "yolov8",
+  "model_type": "yolov12",
   "device": "cuda",
   "confidence_threshold": 0.5,
   "iou_threshold": 0.45,

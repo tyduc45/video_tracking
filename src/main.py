@@ -171,7 +171,10 @@ def main():
     
     logger.info("Loading tracker...")
     try:
+        # ByteTracker 需要模型路径用于YOLO原生track方法
         tracker = ByteTracker(
+            model_path=config.model_path,
+            device=config.device,
             track_high_thresh=config.track_high_thresh,
             track_low_thresh=config.track_low_thresh,
             track_buffer=config.track_buffer,

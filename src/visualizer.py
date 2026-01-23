@@ -127,7 +127,7 @@ class PipelineOutputHandler:
     
     def process_frame(self, frame_data: FrameData):
         """
-        处理一帧数据
+        处理一帧数据，使用YOLO原生plot方法可视化
         
         Args:
             frame_data: Pipeline传递的帧数据
@@ -135,13 +135,10 @@ class PipelineOutputHandler:
         try:
             output_frame = frame_data.frame.copy()
             
-            # 绘制检测框
-            if self.draw_boxes and frame_data.detections:
-                output_frame = ResultVisualizer.draw_detections(output_frame, frame_data.detections)
-            
-            # 绘制追踪框和ID
-            if self.draw_ids and frame_data.tracks:
-                output_frame = ResultVisualizer.draw_tracks(output_frame, frame_data.tracks)
+            # 使用 YOLO 原生的 plot() 方法绘制检测框和追踪ID
+            # 这个方法会自动处理 boxes 和 track_id 的绘制，确保帧间一致性
+            if frame_data.detections and self.draw_boxes:
+                output_frame = frame_data.detections.plot()
             
             # 添加帧信息
             frame_info_text = f"Frame: {frame_data.frame_id}"

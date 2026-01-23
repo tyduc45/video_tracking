@@ -200,89 +200,99 @@ class YOLOInferencer:
 
 class ByteTracker:
     """
-    ByteTrack追踪器的包装类
+    ByteTrack追踪器 - 使用YOLO原生track方法
+    支持 persist=True 实现帧间追踪ID的一致性
     """
     
-    def __init__(self, track_high_thresh: float = 0.6,
+    def __init__(self, model_path: str, device: str = "cuda",
+                 track_high_thresh: float = 0.6,
                  track_low_thresh: float = 0.1,
                  track_buffer: int = 30,
                  frame_rate: float = 30.0):
         """
         Args:
+            model_path: YOLO模型路径
+            device: cuda或cpu
             track_high_thresh: 高阈值
             track_low_thresh: 低阈值
             track_buffer: 追踪缓冲区大小
             frame_rate: 视频帧率
         """
+        self.model_path = model_path
+        self.device = device
         self.track_high_thresh = track_high_thresh
         self.track_low_thresh = track_low_thresh
         self.track_buffer = track_buffer
         self.frame_rate = frame_rate
-        self.tracker = None
+        self.model = None
         
         self._load_tracker()
     
     def _load_tracker(self):
-        """加载ByteTrack追踪器"""
+        """加载YOLO模型用于追踪"""
         try:
-            # 这是一个简化的实现
-            # 实际使用时需要安装proper ByteTrack包
-            logger.info("ByteTrack tracker initialized")
-            
-            # 简单的ID管理器
-            self.next_id = 1
-            self.tracks = {}  # id -> track_info
-            
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_path)
+            logger.info(f"YOLO tracker loaded from {self.model_path}")
         except Exception as e:
-            logger.error(f"Failed to load ByteTrack: {e}")
+            logger.error(f"Failed to load YOLO tracker: {e}")
             raise
     
-    def update(self, detections: List[dict], frame_id: int = None) -> List[dict]:
+    def update(self, frame: np.ndarray, conf_threshold: float = 0.5) -> Optional[any]:
         """
-        更新追踪结果
+        对一帧进行追踪
         
         Args:
-            detections: 检测结果列表
-            frame_id: 帧ID（可选）
+            frame: BGR格式的图像
+            conf_threshold: 置信度阈值
         
         Returns:
-            追踪结果列表，每个元素为:
-            {
-                'track_id': int,
-                'class_id': int,
-                'class_name': str,
-                'confidence': float,
-                'bbox': [x1, y1, x2, y2],
-                'state': str,  # 'tracked' or 'lost'
-            }
+            YOLO追踪结果对象，包含boxes.id (追踪ID) 和 boxes (检测框)
+            该对象可以直接用 .plot() 方法可视化，自动显示追踪框和ID
         """
-        if not detections:
-            return []
+        if self.model is None:
+            logger.error("Tracker model not loaded")
+            return None
         
         try:
-            # 这是一个简化的追踪实现
-            # 实际使用应该集成真正的ByteTrack算法
-            tracks = []
+            # 使用YOLO原生track方法
+            # persist=True 确保追踪ID在帧间保持一致性
+            device = 0 if self.device.lower() == "cuda" else "cpu"
             
-            for detection in detections:
-                # 简单的ID分配（在实际应用中应使用匹配算法）
-                track_id = self.next_id
-                self.next_id += 1
-                
-                tracks.append({
-                    'track_id': track_id,
-                    'class_id': detection['class_id'],
-                    'class_name': detection['class_name'],
-                    'confidence': detection['confidence'],
-                    'bbox': detection['bbox'],
-                    'state': 'tracked',
-                })
+            results = self.model.track(
+                source=frame,
+                conf=conf_threshold,
+                persist=True,      # ← 关键: 启用ID持久化，保证帧间一致性
+                device=device,
+                verbose=False,
+                tracker="bytetrack.yaml"  # 使用默认ByteTrack配置
+            )
             
-            return tracks
-        
+            # 返回追踪结果，包含boxes.id信息
+            return results[0] if results else None
+            
         except Exception as e:
             logger.error(f"Error during tracking: {e}")
-            return []
+            return None
+    
+    def batch_update(self, frames: List[np.ndarray], 
+                    conf_threshold: float = 0.5) -> List[Optional[any]]:
+        """
+        对多帧进行批处理追踪
+        
+        Args:
+            frames: BGR格式的图像列表
+            conf_threshold: 置信度阈值
+        
+        Returns:
+            追踪结果列表，每个元素为YOLO结果对象或None
+        """
+        results = []
+        for frame in frames:
+            result = self.update(frame, conf_threshold)
+            results.append(result)
+        
+        return results
 
 
 class ResultVisualizer:
@@ -291,106 +301,54 @@ class ResultVisualizer:
     """
     
     @staticmethod
-    @staticmethod
-    def draw_detections(frame: np.ndarray, detections: List[dict]) -> np.ndarray:
+    def plot_detections(result) -> np.ndarray:
         """
-        在图像上绘制检测框
+        使用YOLO原生plot方法绘制检测框
         
         Args:
-            frame: 原始图像
-            detections: 检测结果列表
+            result: YOLO推理结果对象
         
         Returns:
             绘制后的图像
         """
-        import cv2
+        if result is None:
+            return None
         
-        result = frame.copy()
-        
-        for detection in detections:
-            x1, y1, x2, y2 = detection['bbox']
-            class_name = detection['class_name']
-            confidence = detection['confidence']
-            
-            # 绘制框 - 使用蓝色和较细的线条（更美观的样式）
-            cv2.rectangle(result, (x1, y1), (x2, y2), (255, 0, 0), 1)
-            
-            # 绘制半透明背景的标签（更易读）
-            label = f"{class_name}: {confidence:.2f}"
-            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            
-            # 绘制标签背景
-            cv2.rectangle(result, 
-                         (x1, y1 - label_size[1] - baseline - 4),
-                         (x1 + label_size[0], y1),
-                         (255, 0, 0), -1)
-            
-            # 绘制标签文本
-            cv2.putText(result, label, (x1, y1 - baseline - 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        return result
+        try:
+            # YOLO的plot()方法自动处理：
+            # - 检测框绘制
+            # - 类别标签
+            # - 置信度显示
+            return result.plot()
+        except Exception as e:
+            logger.error(f"Error plotting detections: {e}")
+            return None
     
     @staticmethod
-    def draw_tracks(frame: np.ndarray, tracks: List[dict]) -> np.ndarray:
+    def plot_tracks(result) -> np.ndarray:
         """
-        在图像上绘制追踪框和ID
+        使用YOLO原生plot方法绘制追踪框和ID
         
         Args:
-            frame: 原始图像
-            tracks: 追踪结果列表
+            result: YOLO追踪结果对象（包含boxes.id）
         
         Returns:
-            绘制后的图像
+            绘制后的图像，显示追踪框和ID
         """
-        import cv2
+        if result is None:
+            return None
         
-        result = frame.copy()
-        
-        for track in tracks:
-            x1, y1, x2, y2 = track['bbox']
-            track_id = track['track_id']
-            class_name = track['class_name']
-            confidence = track['confidence']
-            
-            # 根据状态选择颜色 - 使用蓝色和其他清晰的颜色
-            if track['state'] == 'tracked':
-                color = (255, 0, 0)  # 蓝色 - 已追踪的
-            elif track['state'] == 'confirmed':
-                color = (0, 255, 255)  # 青色 - 已确认的
-            else:
-                color = (0, 0, 255)  # 红色 - 临时的
-            
-            # 绘制框 - 使用更细的线条和清晰的颜色（1像素宽度）
-            cv2.rectangle(result, (x1, y1), (x2, y2), color, 1)
-            
-            # 绘制追踪ID标签（更醒目）
-            label = f"ID:{track_id}"
-            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            
-            # 绘制ID背景（半透明效果）
-            cv2.rectangle(result,
-                         (x1, y1 - label_size[1] - baseline - 6),
-                         (x1 + label_size[0] + 4, y1 - 2),
-                         color, -1)
-            
-            # 绘制ID文本（白色，易读）
-            cv2.putText(result, label, (x1 + 2, y1 - baseline - 4),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # 绘制类别和置信度标签
-            detail_label = f"{class_name}: {confidence:.2f}"
-            detail_size, detail_baseline = cv2.getTextSize(detail_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            
-            cv2.rectangle(result,
-                         (x1, y2),
-                         (x1 + detail_size[0], y2 + detail_size[1] + 4),
-                         color, -1)
-            
-            cv2.putText(result, detail_label, (x1 + 2, y2 + detail_size[1] + 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        
-        return result
+        try:
+            # YOLO的plot()方法自动处理追踪结果的可视化：
+            # - 检测框绘制 (使用不同颜色)
+            # - 追踪ID显示 (确保帧间一致)
+            # - 类别标签
+            # - 置信度显示
+            # persist=True 保证了ID的帧间一致性
+            return result.plot()
+        except Exception as e:
+            logger.error(f"Error plotting tracks: {e}")
+            return None
     
     @staticmethod
     def save_frame(frame: np.ndarray, output_path: str):
@@ -400,3 +358,4 @@ class ResultVisualizer:
         
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         cv2.imwrite(output_path, frame)
+

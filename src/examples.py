@@ -39,7 +39,8 @@ def example1_single_video():
         return []
     
     # 创建追踪器
-    tracker = ByteTracker()
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path)
     
     # 创建输出处理器
     output_handler = PipelineOutputHandler(output_dir="result/example1")
@@ -82,7 +83,8 @@ def example2_multiple_videos():
     def inference_func(frame):
         return []
     
-    tracker = ByteTracker()
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path)
     output_handler = PipelineOutputHandler(output_dir="result/example2")
     
     def save_func(frame_data, output_dir):
@@ -126,7 +128,8 @@ def example3_mixed_sources():
     def inference_func(frame):
         return []
     
-    tracker = ByteTracker()
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path)
     output_handler = PipelineOutputHandler(output_dir="result/example3")
     
     def save_func(frame_data, output_dir):
@@ -194,7 +197,8 @@ def example4_custom_inference():
         
         return detections
     
-    tracker = ByteTracker()
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path)
     output_handler = PipelineOutputHandler(output_dir="result/example4")
     
     def save_func(frame_data, output_dir):
@@ -238,7 +242,8 @@ def example5_realtime_monitoring():
         return []
     
     # 可以为每个摄像头配置不同的参数
-    tracker = ByteTracker(track_high_thresh=0.7)
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path, track_high_thresh=0.7)
     output_handler = PipelineOutputHandler(
         output_dir="result/example5",
         save_frames=True,
@@ -296,7 +301,8 @@ def example6_performance_tuning():
     def inference_func(frame):
         return []
     
-    tracker = ByteTracker()
+    model_path = "../model/yolo12n.engine"
+    tracker = ByteTracker(model_path=model_path)
     output_handler = PipelineOutputHandler(
         output_dir="result/example6",
         save_frames=False,  # 只保存视频，加快处理

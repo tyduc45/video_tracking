@@ -2,19 +2,28 @@
 __pycache__/
 *.py[codz]
 *$py.class
+
+# Video files (but keep test videos if needed)
 *.mp4
 *.mov
 *.avi
 *.wmv
 *.flv
 
-videos/
+# Video directory (but keep for examples)
+# videos/
+
 # C extensions
 *.so
 
+# Keep important directories for CI/CD
+!.github/
+!.github/workflows/
+!test/
 !src/
 !model/
 !.gitignore
+!fixinfo/
 
 
 
@@ -50,19 +59,19 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
-htmlcov/
+# Keep test framework and reports, only ignore cache
 .tox/
 .nox/
 .coverage
 .coverage.*
 .cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
 .hypothesis/
-.pytest_cache/
-cover/
+nosetests.xml
+# *.cover - disabled to keep coverage reports
+# *.py.cover - disabled to keep coverage reports
+# .pytest_cache/ - disabled to keep pytest cache for CI/CD
+# htmlcov/ - disabled to keep HTML coverage reports
+# cover/ - disabled to keep coverage directory
 
 # Translations
 *.mo

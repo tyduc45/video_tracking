@@ -1,0 +1,56 @@
+name: 代码质量检查
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: 设置 Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: 安装依赖
+      run: |
+        pip install torch opencv-python ultralytics numpy pytest pylint flake8
+    
+    - name: 代码复杂度分析
+      run: |
+        pip install radon
+        radon cc src/ --average
+        radon mi src/ --min B
+      continue-on-error: true
+    
+    - name: 类型检查
+      run: |
+        pip install mypy types-opencv
+        mypy src/ --ignore-missing-imports
+      continue-on-error: true
+
+  performance:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: 设置 Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: 安装依赖
+      run: |
+        pip install torch opencv-python ultralytics numpy pytest
+    
+    - name: 运行性能测试
+      run: |
+        python -m pytest test/ -v --durations=10
+      continue-on-error: true

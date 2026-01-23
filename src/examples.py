@@ -1,270 +1,350 @@
+#!/usr/bin/env python3
 """
-完整的使用示例和最佳实践指南
+使用示例
+展示如何使用Pipeline系统的各种常见场景
 """
-import os
+
+import logging
 import sys
-import time
-from pathlib import Path
+import os
 
-# 导入模块
-from video_reader import Video_Handler
-from inference import BatchInferencer
-from video_visualizer import visualize_results
-import threading
-import queue
+# 添加src目录到Python路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pipeline_manager import PipelineManager
+from video_source import LocalVideoSource, WebcamSource
+from inference import YOLOInferencer, ByteTracker, ResultVisualizer
+from visualizer import PipelineOutputHandler
+import numpy as np
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def example_basic_usage():
+def example1_single_video():
     """
-    基本使用示例：完整的多视频追踪流水线
+    示例1：处理单个本地视频文件
     """
-    print("\n" + "="*60)
-    print("示例 1: 基本使用 - 多视频追踪")
-    print("="*60)
+    logger.info("\n=== Example 1: Single Video Processing ===\n")
     
-    # 获取项目路径
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
+    # 创建管理器
+    manager = PipelineManager(output_dir="result/example1")
     
-    # 配置视频路径
-    video_paths = [
-        os.path.join(project_root, "videos", "video0.mp4"),
-        os.path.join(project_root, "videos", "video1.mp4")
-    ]
+    # 创建视频源
+    video_source = LocalVideoSource("videos/video1.mp4")
     
-    # 配置模型和输出路径
-    model_path = os.path.join(project_root, "model", "yolo12n.pt")
-    result_dir = os.path.join(project_root, "result")
+    # 创建简单的推理函数（占位符）
+    def inference_func(frame):
+        # 实现YOLO推理
+        return []
     
-    # 检查文件是否存在
-    for path in video_paths:
-        if not os.path.exists(path):
-            print(f"⚠️  警告：视频文件不存在 {path}")
+    # 创建追踪器
+    tracker = ByteTracker()
     
-    if not os.path.exists(model_path):
-        print(f"⚠️  警告：模型文件不存在 {model_path}")
-        return
+    # 创建输出处理器
+    output_handler = PipelineOutputHandler(output_dir="result/example1")
     
-    os.makedirs(result_dir, exist_ok=True)
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
     
-    # 创建事件
-    stop_event = threading.Event()
-    
-    # 1. 初始化视频读取器
-    print("\n[Step 1] 初始化视频读取器...")
-    handler = Video_Handler(capacity=1000, path_list=video_paths, stop_event=stop_event)
-    frame_queue = handler.getbuffer()
-    
-    # 2. 初始化推理器（包含追踪）
-    print("[Step 2] 初始化推理器和追踪系统...")
-    inferencer = BatchInferencer(
-        queue=frame_queue,
-        batch_size=16,
-        model_path=model_path,
-        save_path=result_dir,
-        stop_event=stop_event,
-        video_paths=video_paths
+    # 创建Pipeline
+    pipeline_id = manager.create_pipeline(
+        video_source=video_source,
+        inference_func=inference_func,
+        tracker_instance=tracker,
+        save_func=save_func
     )
     
-    print("\n[Step 3] 启动处理流水线...")
-    print(f"  - 视频数量: {len(video_paths)}")
-    print(f"  - 推理批大小: 16")
-    print(f"  - 结果保存目录: {result_dir}")
+    # 启动和等待
+    manager.start_all()
+    manager.wait_all(timeout=600)
     
-    # 启动线程
-    inferencer.start()
-    handler.read_video()
+    # 生成视频和统计
+    output_handler.generate_all_videos()
+    manager.print_all_statistics()
+
+
+def example2_multiple_videos():
+    """
+    示例2：并行处理多个视频
+    """
+    logger.info("\n=== Example 2: Multiple Videos Processing ===\n")
     
-    try:
-        # 等待视频读取完成
-        handler.pool.shutdown(wait=True)
-        print("\n✓ 所有视频读取完成")
-        
-        # 发送停止信号给推理器
-        frame_queue.put(None)
-        
-        # 等待推理完成
-        processed_frames = 0
-        while inferencer.is_alive():
-            q_size = frame_queue.qsize()
-            print(f"  处理中... 队列堆积: {q_size} 帧", end='\r')
-            time.sleep(0.5)
-        
-        print("\n✓ 推理和追踪完成")
-        
-    except KeyboardInterrupt:
-        print("\n⚠️  用户中断")
-        stop_event.set()
-        return
-    finally:
-        stop_event.set()
-        try:
-            frame_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        inferencer.stop()
-        inferencer.join(timeout=2)
+    manager = PipelineManager(output_dir="result/example2", max_pipelines=5)
     
-    # 3. 生成最终视频
-    print("\n[Step 4] 生成追踪视频...")
-    try:
-        videos = visualize_results(
-            frame_dir=result_dir,
-            output_dir=os.path.join(result_dir, "videos"),
-            fps=30
+    # 创建多个视频源
+    video_sources = [
+        LocalVideoSource("videos/video1.mp4"),
+        LocalVideoSource("videos/video2.mp4"),
+    ]
+    
+    # 共享的推理和追踪
+    def inference_func(frame):
+        return []
+    
+    tracker = ByteTracker()
+    output_handler = PipelineOutputHandler(output_dir="result/example2")
+    
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
+    
+    # 为每个视频创建Pipeline
+    for i, source in enumerate(video_sources):
+        manager.create_pipeline(
+            video_source=source,
+            inference_func=inference_func,
+            tracker_instance=tracker,
+            save_func=save_func,
+            pipeline_id=f"video_{i}"
         )
-        print(f"✓ 生成了 {len(videos)} 个视频文件")
-    except Exception as e:
-        print(f"⚠️  视频生成失败: {e}")
     
-    print("\n" + "="*60)
-    print("处理完成！")
-    print("="*60)
+    # 并行处理
+    manager.start_all()
+    manager.wait_all(timeout=600)
+    
+    output_handler.generate_all_videos()
+    manager.print_all_statistics()
 
 
-def example_single_video_tracking():
+def example3_mixed_sources():
     """
-    示例 2: 单个视频追踪（用于测试）
+    示例3：混合处理本地视频和网络直播
     """
-    print("\n" + "="*60)
-    print("示例 2: 单个视频追踪测试")
-    print("="*60)
+    logger.info("\n=== Example 3: Mixed Sources (Local + Webcam) ===\n")
     
-    from tracker_manager import TrackerManager, FrameData
-    import cv2
-    import numpy as np
+    manager = PipelineManager(output_dir="result/example3")
     
-    # 创建模拟帧
-    def create_dummy_frame(frame_id):
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(frame, f"Frame {frame_id}", (50, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        return frame
+    # 本地视频源
+    local_source = LocalVideoSource("videos/video1.mp4")
     
-    # 初始化追踪管理器
-    video_paths = ["video0.mp4"]
-    tracker_manager = TrackerManager(video_paths)
+    # 网络摄像头（RTSP）
+    # webcam_source = WebcamSource("rtsp://192.168.1.100/stream")
     
-    print("模拟向追踪器发送乱序帧...")
+    # 或本地摄像头
+    # webcam_source = WebcamSource(0)
     
-    # 模拟乱序的帧序列
-    frame_sequence = [1, 3, 2, 5, 4, 6, 7, 8]
+    def inference_func(frame):
+        return []
     
-    for frame_id in frame_sequence:
-        frame = create_dummy_frame(frame_id)
-        frame_data = FrameData(
-            frame=frame,
-            path="video0.mp4",
-            video_id="video_0",
-            frame_id=frame_id,
-            detections=None
+    tracker = ByteTracker()
+    output_handler = PipelineOutputHandler(output_dir="result/example3")
+    
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
+    
+    # 创建Pipeline
+    manager.create_pipeline(
+        video_source=local_source,
+        inference_func=inference_func,
+        tracker_instance=tracker,
+        save_func=save_func,
+        pipeline_id="local_video"
+    )
+    
+    # 只在有摄像头时添加
+    # manager.create_pipeline(
+    #     video_source=webcam_source,
+    #     inference_func=inference_func,
+    #     tracker_instance=tracker,
+    #     save_func=save_func,
+    #     pipeline_id="webcam"
+    # )
+    
+    manager.start_all()
+    manager.wait_all(timeout=600)
+    
+    output_handler.generate_all_videos()
+    manager.print_all_statistics()
+
+
+def example4_custom_inference():
+    """
+    示例4：使用自定义推理函数
+    """
+    logger.info("\n=== Example 4: Custom Inference Function ===\n")
+    
+    manager = PipelineManager(output_dir="result/example4")
+    
+    video_source = LocalVideoSource("videos/video1.mp4")
+    
+    # 自定义推理函数示例
+    def custom_inference_func(frame):
+        """
+        自定义推理函数
+        
+        Args:
+            frame: BGR格式的图像
+        
+        Returns:
+            检测结果列表
+        """
+        # 这里可以实现自己的推理逻辑
+        # 例如：使用不同的模型、自定义后处理等
+        
+        detections = []
+        
+        # 示例：在图像中心检测到一个对象
+        h, w = frame.shape[:2]
+        detections.append({
+            'class_id': 0,
+            'class_name': 'person',
+            'confidence': 0.95,
+            'bbox': [w//4, h//4, 3*w//4, 3*h//4],
+        })
+        
+        return detections
+    
+    tracker = ByteTracker()
+    output_handler = PipelineOutputHandler(output_dir="result/example4")
+    
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
+    
+    manager.create_pipeline(
+        video_source=video_source,
+        inference_func=custom_inference_func,
+        tracker_instance=tracker,
+        save_func=save_func
+    )
+    
+    manager.start_all()
+    manager.wait_all(timeout=600)
+    
+    output_handler.generate_all_videos()
+    manager.print_all_statistics()
+
+
+def example5_realtime_monitoring():
+    """
+    示例5：实时监控多个摄像头（注意：需要实际的摄像头）
+    """
+    logger.info("\n=== Example 5: Real-time Multi-Camera Monitoring ===\n")
+    
+    manager = PipelineManager(output_dir="result/example5")
+    
+    # 模拟多个摄像头（实际使用时替换为真实URL）
+    # camera_sources = [
+    #     WebcamSource("rtsp://camera1.local/stream"),
+    #     WebcamSource("rtsp://camera2.local/stream"),
+    #     WebcamSource("rtsp://camera3.local/stream"),
+    # ]
+    
+    # 演示用：使用本地视频模拟摄像头
+    camera_sources = [
+        LocalVideoSource("videos/video1.mp4"),
+    ]
+    
+    def inference_func(frame):
+        return []
+    
+    # 可以为每个摄像头配置不同的参数
+    tracker = ByteTracker(track_high_thresh=0.7)
+    output_handler = PipelineOutputHandler(
+        output_dir="result/example5",
+        save_frames=True,
+        save_video=True,
+        draw_boxes=True,
+        draw_ids=True,
+    )
+    
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
+    
+    # 为每个摄像头创建独立的Pipeline
+    for i, source in enumerate(camera_sources):
+        manager.create_pipeline(
+            video_source=source,
+            inference_func=inference_func,
+            tracker_instance=tracker,
+            save_func=save_func,
+            pipeline_id=f"camera_{i}"
         )
-        
-        ready_frames = tracker_manager.process_frame(frame_data)
-        
-        print(f"  → 接收帧 {frame_id}: ", end="")
-        if ready_frames:
-            print(f"✓ 输出 {len(ready_frames)} 个已排序的帧 "
-                  f"(ID: {[f.frame_id for f in ready_frames]})")
-        else:
-            print(f"⏳ 等待中（进入队列）")
-        
-        tracker_manager.print_status()
     
-    print("\n✓ 乱序恢复演示完成")
+    # 并行监控所有摄像头
+    manager.start_all()
+    manager.wait_all(timeout=None)  # 无限等待，适合实时监控
+    
+    output_handler.generate_all_videos()
+    manager.print_status()
 
 
-def example_advanced_configuration():
+def example6_performance_tuning():
     """
-    示例 3: 高级配置 - 自定义参数
+    示例6：性能优化
     """
-    print("\n" + "="*60)
-    print("示例 3: 高级配置")
-    print("="*60)
+    logger.info("\n=== Example 6: Performance Tuning ===\n")
     
-    configs = {
-        "batch_size": [8, 16, 32],
-        "queue_capacity": [500, 1000, 2000],
-        "fps": [15, 30, 60]
-    }
+    # 创建优化的配置
+    from config import Config
     
-    print("\n推荐配置组合：\n")
+    config = Config(
+        model_path="model/yolo12n.pt",  # 使用较小的模型
+        device="cuda",                    # 使用GPU
+        confidence_threshold=0.6,         # 提高阈值减少检测数量
+        batch_size=4,
+        queue_size=20,                    # 增加队列大小
+        max_pipelines=10,
+    )
     
-    print("1. 低延迟配置（实时处理）")
-    print("   - batch_size=8")
-    print("   - queue_capacity=500")
-    print("   - 适用于实时监控场景")
-    print()
+    manager = PipelineManager(
+        output_dir="result/example6",
+        max_pipelines=config.max_pipelines
+    )
     
-    print("2. 均衡配置（通用）")
-    print("   - batch_size=16")
-    print("   - queue_capacity=1000")
-    print("   - 适用于大多数应用")
-    print()
+    video_source = LocalVideoSource("videos/video1.mp4")
     
-    print("3. 高吞吐配置（离线处理）")
-    print("   - batch_size=32")
-    print("   - queue_capacity=2000")
-    print("   - 适用于大规模离线处理")
-
-
-def example_monitoring():
-    """
-    示例 4: 实时监控追踪状态
-    """
-    print("\n" + "="*60)
-    print("示例 4: 追踪状态监控")
-    print("="*60)
+    def inference_func(frame):
+        return []
     
-    from tracker_manager import TrackerManager
+    tracker = ByteTracker()
+    output_handler = PipelineOutputHandler(
+        output_dir="result/example6",
+        save_frames=False,  # 只保存视频，加快处理
+        save_video=True,
+        fps=config.save_fps,
+    )
     
-    video_paths = ["video0.mp4", "video1.mp4", "video2.mp4"]
-    tracker_manager = TrackerManager(video_paths)
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
     
-    print("\n追踪管理器初始化完成，各视频源状态：\n")
+    manager.create_pipeline(
+        video_source=video_source,
+        inference_func=inference_func,
+        tracker_instance=tracker,
+        save_func=save_func
+    )
     
-    status = tracker_manager.get_status()
-    for video_id, info in status.items():
-        print(f"  {video_id}:")
-        print(f"    - 期望下一帧: {info['expected_frame_id']}")
-        print(f"    - 乱序队列大小: {info['queue_size']}")
-        print(f"    - 缓冲区大小: {info['buffer_size']}")
+    manager.start_all()
+    manager.wait_all()
     
-    print("\n🔍 监控指标说明：")
-    print("  - 期望帧号: 追踪器期望的下一个帧编号")
-    print("  - 乱序队列: 到达但时序不对的帧数")
-    print("  - 缓冲区: 已排序完成可使用的帧数")
-
-
-def print_menu():
-    """打印菜单"""
-    print("\n" + "="*60)
-    print("YOLO追踪系统 - 使用示例菜单")
-    print("="*60)
-    print("1. 基本使用 - 完整的多视频追踪流水线")
-    print("2. 单个视频追踪测试")
-    print("3. 高级配置建议")
-    print("4. 追踪状态监控演示")
-    print("0. 退出")
-    print("="*60)
+    output_handler.generate_all_videos()
+    manager.print_all_statistics()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        choice = sys.argv[1]
-    else:
-        print_menu()
-        choice = input("\n请选择 (0-4): ").strip()
+    # 选择要运行的示例
+    examples = {
+        '1': ('Single Video', example1_single_video),
+        '2': ('Multiple Videos', example2_multiple_videos),
+        '3': ('Mixed Sources', example3_mixed_sources),
+        '4': ('Custom Inference', example4_custom_inference),
+        '5': ('Real-time Monitoring', example5_realtime_monitoring),
+        '6': ('Performance Tuning', example6_performance_tuning),
+    }
     
-    if choice == "1":
-        example_basic_usage()
-    elif choice == "2":
-        example_single_video_tracking()
-    elif choice == "3":
-        example_advanced_configuration()
-    elif choice == "4":
-        example_monitoring()
-    elif choice == "0":
-        print("退出")
+    if len(sys.argv) > 1:
+        example_id = sys.argv[1]
+        if example_id in examples:
+            name, func = examples[example_id]
+            logger.info(f"Running Example {example_id}: {name}")
+            func()
+        else:
+            logger.error(f"Unknown example: {example_id}")
+            logger.info("Available examples:")
+            for idx, (name, _) in examples.items():
+                logger.info(f"  {idx}: {name}")
     else:
-        print("无效的选择")
+        logger.info("Usage: python examples.py <example_id>")
+        logger.info("Available examples:")
+        for idx, (name, _) in examples.items():
+            logger.info(f"  {idx}: {name}")

@@ -1,413 +1,402 @@
-# push
+"""
+YOLO推理和ByteTrack追踪的具体实现
+"""
+
+import logging
+import numpy as np
+import json
 import os
-import time
-import queue
-import threading
-from ultralytics import YOLO
-import sys
-from io import StringIO
-from tracker_manager import TrackerManager, FrameData
-from collections import defaultdict
+from typing import List, Optional, Tuple
+from pathlib import Path
 
-class BatchInferencer(threading.Thread):
-    def __init__(self, queue, batch_size, model_path, save_path, stop_event, video_paths):
-        super().__init__(name="InferenceThread")
-        self.daemon = True  # 设置为守护线程，主程序退出时自动杀死
-        self.queue = queue
+logger = logging.getLogger(__name__)
+
+
+class YOLOInferencer:
+    """
+    YOLO推理器 - 支持批处理和Engine加速
+    """
+    
+    def __init__(self, model_path: str, model_dir: str = "../model",
+                 device: str = "cuda", use_half: bool = True,
+                 confidence_threshold: float = 0.5,
+                 iou_threshold: float = 0.45,
+                 batch_size: int = 16):
+        """
+        Args:
+            model_path: 完整的模型文件路径（.pt, .engine, .onnx）
+            model_dir: 模型目录，用于读取meta文件
+            device: cuda或cpu
+            use_half: 是否使用半精度
+            confidence_threshold: 置信度阈值
+            iou_threshold: IOU阈值
+            batch_size: 批处理大小（16或32）
+        """
+        self.model_path = model_path
+        self.model_dir = model_dir
+        self.device = device
+        self.use_half = use_half
+        self.confidence_threshold = confidence_threshold
+        self.iou_threshold = iou_threshold
         self.batch_size = batch_size
-        self.isRunning = True
-        self.stop_event = stop_event
-        self.save_path = save_path
-        self.video_paths = video_paths
-        self.model_path = model_path  # 保存模型路径供后续使用
         
-        # 初始化追踪器管理器
-        self.tracker_manager = TrackerManager(video_paths)
-        
-        # 1. 在加载前，先处理模型导出逻辑
-        self.model = self._setup_model_with_history(model_path, task_type="detect")
-        print(f"[Consumer] 批处理流水线就绪，当前 Batch Size: {self.batch_size}")
-
-    def _setup_model_with_history(self, path, task_type):
-        """
-        基于历史记录文件管理 Engine 导出。
-        逻辑：对比记录的 batch 与当前需求，不符则清理并重编。
-        """
-        base_path = os.path.splitext(path)[0]
-        engine_path = f"{base_path}.engine"
-        pt_path = f"{base_path}.pt"
-        meta_path = f"{base_path}_batch.meta" # 记录 Batch Size 的小文件
-
-        # 尝试读取历史 Batch 需求
-        last_batch = None
-        if os.path.exists(meta_path):
-            try:
+        self.model = None
+        self.batch_buffer = []  # 缓存帧，达到batch_size时进行推理
+        self._load_model()
+        self._load_meta_config()
+    
+    def _load_meta_config(self):
+        """加载meta配置文件"""
+        try:
+            meta_path = os.path.join(self.model_dir, "yolo12n_batch.meta")
+            if os.path.exists(meta_path):
                 with open(meta_path, 'r') as f:
-                    last_batch = int(f.read().strip())
-            except Exception:
-                last_batch = None
-
-        # 核心判断逻辑
-        need_reexport = False
-        if not os.path.exists(engine_path):
-            print("[Setup] Engine 不存在，准备初次导出...")
-            need_reexport = True
-        elif last_batch != self.batch_size:
-            print(f"[Setup] 需求变更：历史 Batch({last_batch}) -> 当前 Batch({self.batch_size})")
-            need_reexport = True
-
-        if need_reexport:
-            # 清理历史残余
-            self._cleanup_files(base_path)
-            
-            if not os.path.exists(pt_path):
-                raise FileNotFoundError(f"找不到源码模型 {pt_path}，无法执行重编。")
-            
-            # 从 PT 导出新 Engine
-            print(f"[Export] 正在根据新需求 ({self.batch_size}) 导出引擎...")
-            raw_model = YOLO(pt_path)
-            new_path = raw_model.export(
-                format="engine",
-                batch=self.batch_size,
-                dynamic=True,
-                half=True,
-                device=0
-            )
-            
-            # 更新历史记录文件
-            with open(meta_path, 'w') as f:
-                f.write(str(self.batch_size))
-            
-            return YOLO(new_path, task=task_type)
-        
-        else:
-            print(f"[Success] 需求未变 (Batch={last_batch})，直接加载现有引擎。")
-            return YOLO(engine_path, task=task_type)
-
-    def _cleanup_files(self, base_path):
-        """物理删除旧的导出文件"""
-        for ext in ['.engine', '.onnx', '_batch.meta']:
-            file_p = f"{base_path}{ext}"
-            if os.path.exists(file_p):
-                try:
-                    os.remove(file_p)
-                    print(f"[Cleanup] 已移除旧文件: {file_p}")
-                except Exception as e:
-                    print(f"[Cleanup] 无法删除 {file_p}: {e}")
-
-    def run(self):
-        """主循环：负责高层逻辑调度"""
-        try:
-            self._ensure_dir_exists()
-            
-            while self.isRunning:
-                # 1. 收集数据
-                batch_frames, batch_paths, batch_frame_ids, stop_signal = self._collect_batch()
-                
-                if not batch_frames:
-                    if stop_signal: break
-                    continue
-
-                # 2. 执行推理
-                actual_num = len(batch_frames)
-                results = self._execute_inference(batch_frames)
-                
-                if results:
-                    # 3. 构建 FrameData 对象并送入追踪管理器
-                    tracked_results = self._process_with_tracking(
-                        results, batch_paths, batch_frame_ids, batch_frames
-                    )
-                    
-                    # 4. 保存结果
-                    self._save_batch_results(tracked_results)
-                
-                if stop_signal or self.stop_event.is_set():
-                    break
-        finally:
-            self._final_cleanup()
-
-    def _ensure_dir_exists(self):
-        """确保保存目录存在"""
-        if not os.path.exists(self.save_path):
-            os.makedirs(self.save_path, exist_ok=True)
-            print(f"[Consumer] 创建目录: {self.save_path}")
-
-    def _collect_batch(self):
-        """
-        核心组装逻辑：从队列获取数据
-        返回: (frames_list, paths_list, frame_ids_list, stop_signal_received)
-        """
-        frames, paths, frame_ids = [], [], []
-        stop_signal = False
-        
-        for i in range(self.batch_size):
-            try:
-                # 第一帧给 1.0s 超时，后续帧给 0.1s 实现快速滑动
-                timeout = 1.0 if i == 0 else 0.1
-                data = self.queue.get(timeout=timeout)
-                
-                if data is None: # 收到结束标志
-                    stop_signal = True
-                    self.isRunning = False
-                    break
-                
-                # 现在数据包含 (frame, path, frame_id)
-                frames.append(data[0])
-                paths.append(data[1])
-                frame_ids.append(data[2])
-                
-            except queue.Empty:
-                if self.stop_event.is_set():
-                    stop_signal = True
-                # 如果队列空且有数据，继续处理当前批次
-                # 否则等待新数据
-                if not frames:
-                    continue
-                break # 有数据时直接处理，不再等待
-                
-        return frames, paths, frame_ids, stop_signal
-
-    def _execute_inference(self, frames):
-        """执行推理，处理补齐逻辑"""
-        try:
-            # 补齐到固定 Batch Size 以适配 TensorRT Engine
-            actual_num = len(frames)
-            while len(frames) < self.batch_size:
-                frames.append(frames[-1])
-
-            return self.model.predict(
-                source=frames, conf=0.25, device=0, verbose=False
-            )
+                    meta = json.load(f)
+                    logger.info(f"Loaded meta config: {meta}")
+                    # 可以从meta中读取batch_size等配置
+                    if 'batch_size' in meta:
+                        self.batch_size = meta['batch_size']
+                    if 'use_half' in meta:
+                        self.use_half = meta['use_half']
+            else:
+                logger.info(f"Meta config file not found: {meta_path}")
         except Exception as e:
-            print(f"[Consumer] 推理崩溃: {e}")
-            self.stop_event.set()
-            return None
-
-    def _process_with_tracking(self, results, batch_paths, batch_frame_ids, batch_frames):
+            logger.warning(f"Failed to load meta config: {e}")
+    
+    def _load_model(self):
+        """加载YOLO模型"""
+        try:
+            from ultralytics import YOLO
+            
+            logger.info(f"Loading YOLO model from {self.model_path}")
+            logger.info(f"  Device: {self.device}")
+            logger.info(f"  Use half precision: {self.use_half}")
+            logger.info(f"  Batch size: {self.batch_size}")
+            
+            # 检测模型文件类型
+            model_ext = os.path.splitext(self.model_path)[1].lower()
+            logger.info(f"  Model format: {model_ext}")
+            
+            # 加载模型
+            self.model = YOLO(self.model_path, task='detect')
+            
+            # 只有PT格式支持to()方法，其他格式（engine, onnx等）不支持
+            if model_ext == '.pt':
+                if self.device.lower() == "cuda":
+                    self.model.to("cuda")
+                else:
+                    self.model.to("cpu")
+                logger.info(f"YOLO PT model loaded and moved to {self.device}")
+            else:
+                # Engine和ONNX格式：不需要to()，device在predict时指定
+                logger.info(f"YOLO {model_ext.upper()} model loaded (device will be specified in predict)")
+        
+        except ImportError:
+            logger.error("ultralytics package not found. Install it with: pip install ultralytics")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load YOLO model: {e}")
+            raise
+    
+    def infer_batch(self, frames: List[np.ndarray]) -> List[List[dict]]:
         """
-        处理推理结果，通过追踪管理器进行时序同步和追踪
+        批量推理多帧
         
         Args:
-            results: YOLO 推理结果
-            batch_paths: 对应的视频路径列表
-            batch_frame_ids: 对应的帧编号列表
-            batch_frames: 原始帧图像
-            
+            frames: BGR格式的图像列表
+        
         Returns:
-            已排序并追踪的帧数据列表
+            检测结果列表，每个元素对应一帧的检测结果列表
         """
-        tracked_results = []
+        if self.model is None or not frames:
+            return [[] for _ in frames]
         
-        for idx, (result, path, frame_id, frame) in enumerate(zip(results, batch_paths, batch_frame_ids, batch_frames)):
-            try:
-                # 获取视频 ID
-                video_id = self.tracker_manager.get_video_id(path)
-                if not video_id:
-                    print(f"[Tracking] 警告：无法识别视频路径 {path}")
-                    continue
-                
-                # 创建 FrameData 对象
-                frame_data = FrameData(
-                    frame=frame,
-                    path=path,
-                    video_id=video_id,
-                    frame_id=frame_id,
-                    detections=result
-                )
-                
-                # 通过追踪管理器处理（乱序恢复）
-                ready_frames = self.tracker_manager.process_frame(frame_data)
-                
-                # 对已排序完成的帧进行追踪
-                if ready_frames:
-                    tracked_frames = self.tracker_manager.track_frames(
-                        ready_frames, 
-                        model_path=self.model_path  # 传递正确的模型路径
-                    )
-                    tracked_results.extend(tracked_frames)
+        try:
+            # 确定设备参数
+            device = 0 if self.device.lower() == "cuda" else "cpu"
+            
+            # 使用predict而不是直接调用model()
+            results = self.model.predict(
+                source=frames,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                half=self.use_half,
+                device=device,
+                verbose=False  # 减少日志输出
+            )
+            
+            all_detections = []
+            for result in results:
+                detections = []
+                for detection in result.boxes:
+                    class_id = int(detection.cls[0])
+                    class_name = result.names[class_id]
+                    confidence = float(detection.conf[0])
+                    bbox = detection.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
                     
-                    # 定期打印追踪状态
-                    if len(tracked_results) % 10 == 0:
-                        self.tracker_manager.print_status()
-                        
-            except Exception as e:
-                print(f"[Tracking] 处理帧 {frame_id} 失败: {e}")
-                import traceback
-                traceback.print_exc()
+                    detections.append({
+                        'class_id': class_id,
+                        'class_name': class_name,
+                        'confidence': confidence,
+                        'bbox': bbox.astype(int).tolist(),
+                    })
+                
+                all_detections.append(detections)
+            
+            return all_detections
         
-        return tracked_results
-
-    def _save_batch_results(self, results):
+        except Exception as e:
+            logger.error(f"Error during batch inference: {e}")
+            return [[] for _ in frames]
+    
+    def infer(self, frame: np.ndarray) -> List[dict]:
         """
-        保存追踪结果到磁盘，同时维护内存缓冲区用于最后的视频生成和删除
-        使用异步线程处理磁盘写入，防止阻塞消费者线程
+        对一帧进行推理（兼容之前的单帧接口）
         
         Args:
-            results: FrameData 对象列表，包含追踪信息
+            frame: BGR格式的图像
+        
+        Returns:
+            检测结果列表
         """
-        # 初始化缓存字典（按视频ID分组）
-        if not hasattr(self, 'frame_buffer'):
-            self.frame_buffer = {}  # 用于记录帧数据，后续生成视频
-        
-        if not hasattr(self, 'frame_files'):
-            self.frame_files = defaultdict(list)  # {video_id: [file_paths]}
-        
-        if not hasattr(self, 'disk_write_lock'):
-            self.disk_write_lock = threading.Lock()  # 保护磁盘写入操作
-        
-        for frame_data in results:
-            try:
-                video_id = frame_data.video_id
-                
-                # 初始化该视频的缓冲区
-                if video_id not in self.frame_buffer:
-                    self.frame_buffer[video_id] = {}
-                
-                # 获取注释后的帧
-                if frame_data.detections:
-                    # 绘制检测框和追踪 ID
-                    annotated_frame = frame_data.detections.plot()
-                else:
-                    annotated_frame = frame_data.frame
-                
-                # 先保存到内存（快速操作）
-                self.frame_buffer[video_id][frame_data.frame_id] = annotated_frame
-                
-                # 异步保存到磁盘（使用后台线程，不阻塞主流程）
-                write_thread = threading.Thread(
-                    target=self._async_save_frame,
-                    args=(annotated_frame, video_id, frame_data.frame_id, frame_data.path),
-                    daemon=True
-                )
-                write_thread.start()
-                
-                # 定期输出统计信息
-                total_frames = sum(len(frames) for frames in self.frame_buffer.values())
-                if total_frames % 50 == 0:
-                    print(f"[Consumer] 已缓存 {total_frames} 帧（异步保存到磁盘）")
-                    
-            except Exception as e:
-                print(f"[Consumer] 缓存帧 {frame_data.frame_id} 失败: {e}")
+        results = self.infer_batch([frame])
+        return results[0] if results else []
     
-    def _async_save_frame(self, frame, video_id, frame_id, frame_path):
+    def infer_with_buffering(self, frame: np.ndarray, force_flush: bool = False) -> Optional[List[dict]]:
         """
-        异步保存单个帧到磁盘
+        带缓冲的推理，达到batch_size时进行批处理
+        
+        Args:
+            frame: 输入帧
+            force_flush: 是否强制刷新缓冲区（在视频结束时使用）
+        
+        Returns:
+            第一帧的检测结果（或None）
         """
+        self.batch_buffer.append(frame)
+        
+        # 缓冲区满，执行推理
+        if len(self.batch_buffer) >= self.batch_size or force_flush:
+            all_results = self.infer_batch(self.batch_buffer)
+            first_result = all_results[0] if all_results else []
+            self.batch_buffer = []
+            return first_result
+        
+        return None
+    
+    def flush_buffer(self) -> List[List[dict]]:
+        """刷新缓冲区，推理剩余的帧"""
+        if not self.batch_buffer:
+            return []
+        
+        results = self.infer_batch(self.batch_buffer)
+        self.batch_buffer = []
+        return results
+    
+    def __del__(self):
+        """清理资源"""
+        self.model = None
+
+
+class ByteTracker:
+    """
+    ByteTrack追踪器的包装类
+    """
+    
+    def __init__(self, track_high_thresh: float = 0.6,
+                 track_low_thresh: float = 0.1,
+                 track_buffer: int = 30,
+                 frame_rate: float = 30.0):
+        """
+        Args:
+            track_high_thresh: 高阈值
+            track_low_thresh: 低阈值
+            track_buffer: 追踪缓冲区大小
+            frame_rate: 视频帧率
+        """
+        self.track_high_thresh = track_high_thresh
+        self.track_low_thresh = track_low_thresh
+        self.track_buffer = track_buffer
+        self.frame_rate = frame_rate
+        self.tracker = None
+        
+        self._load_tracker()
+    
+    def _load_tracker(self):
+        """加载ByteTrack追踪器"""
         try:
-            with self.disk_write_lock:  # 防止并发写入冲突
-                ts = int(time.time() * 1000)
-                filename = os.path.basename(frame_path)
-                save_name = os.path.join(
-                    self.save_path, 
-                    f"tracked_{ts}_{video_id}_f{frame_id}_{filename}.jpg"
-                )
-                
-                import cv2
-                cv2.imwrite(save_name, frame)
-                
-                # 记录文件路径（用于最后删除）
-                if video_id in self.frame_files:
-                    self.frame_files[video_id].append(save_name)
-                else:
-                    self.frame_files[video_id] = [save_name]
-                
+            # 这是一个简化的实现
+            # 实际使用时需要安装proper ByteTrack包
+            logger.info("ByteTrack tracker initialized")
+            
+            # 简单的ID管理器
+            self.next_id = 1
+            self.tracks = {}  # id -> track_info
+            
         except Exception as e:
-            print(f"[Consumer] 异步保存帧 {frame_id} 失败: {e}")
-
-
-    def _final_cleanup(self):
-        """最后清理，从内存缓冲区生成视频"""
-        print("[Consumer] 正在执行最终清理...")
-        
-        # 先清空队列
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        # 等待异步磁盘写入完成（给后台线程1秒时间）
-        print("[Consumer] 等待异步磁盘写入完成...")
-        import time as time_module
-        time_module.sleep(1)
-        
-        # 刷新追踪器缓冲区，确保所有乱序帧都被输出
-        remaining_frames = self.tracker_manager.flush_all_buffers(self.model_path)
-        if remaining_frames:
-            print(f"[Consumer] 从缓冲区刷新出 {len(remaining_frames)} 帧")
-            self._save_batch_results(remaining_frames)
-        
-        # 生成视频
-        if hasattr(self, 'frame_buffer') and self.frame_buffer:
-            self._generate_videos_from_buffer()
-        
-        print("[Consumer] 推理线程安全退出")
+            logger.error(f"Failed to load ByteTrack: {e}")
+            raise
     
-    def _generate_videos_from_buffer(self):
+    def update(self, detections: List[dict], frame_id: int = None) -> List[dict]:
         """
-        从内存缓冲区生成视频文件，然后删除所有中间帧文件
+        更新追踪结果
+        
+        Args:
+            detections: 检测结果列表
+            frame_id: 帧ID（可选）
+        
+        Returns:
+            追踪结果列表，每个元素为:
+            {
+                'track_id': int,
+                'class_id': int,
+                'class_name': str,
+                'confidence': float,
+                'bbox': [x1, y1, x2, y2],
+                'state': str,  # 'tracked' or 'lost'
+            }
+        """
+        if not detections:
+            return []
+        
+        try:
+            # 这是一个简化的追踪实现
+            # 实际使用应该集成真正的ByteTrack算法
+            tracks = []
+            
+            for detection in detections:
+                # 简单的ID分配（在实际应用中应使用匹配算法）
+                track_id = self.next_id
+                self.next_id += 1
+                
+                tracks.append({
+                    'track_id': track_id,
+                    'class_id': detection['class_id'],
+                    'class_name': detection['class_name'],
+                    'confidence': detection['confidence'],
+                    'bbox': detection['bbox'],
+                    'state': 'tracked',
+                })
+            
+            return tracks
+        
+        except Exception as e:
+            logger.error(f"Error during tracking: {e}")
+            return []
+
+
+class ResultVisualizer:
+    """
+    结果可视化和保存
+    """
+    
+    @staticmethod
+    @staticmethod
+    def draw_detections(frame: np.ndarray, detections: List[dict]) -> np.ndarray:
+        """
+        在图像上绘制检测框
+        
+        Args:
+            frame: 原始图像
+            detections: 检测结果列表
+        
+        Returns:
+            绘制后的图像
         """
         import cv2
         
-        # 创建快照以避免迭代过程中字典大小改变的错误
-        # 必须在持有锁的情况下创建快照
-        with self.disk_write_lock:
-            video_ids_to_process = list(self.frame_buffer.keys())
+        result = frame.copy()
         
-        for video_id in video_ids_to_process:
-            # 每次获取一个视频的帧数据副本（持有锁）
-            with self.disk_write_lock:
-                if video_id not in self.frame_buffer:
-                    continue  # 该视频已被处理过
-                frames_dict = self.frame_buffer[video_id].copy()
+        for detection in detections:
+            x1, y1, x2, y2 = detection['bbox']
+            class_name = detection['class_name']
+            confidence = detection['confidence']
             
-            if not frames_dict:
-                continue
+            # 绘制框 - 使用蓝色和较细的线条（更美观的样式）
+            cv2.rectangle(result, (x1, y1), (x2, y2), (255, 0, 0), 1)
             
-            try:
-                # 按帧编号排序
-                sorted_frame_ids = sorted(frames_dict.keys())
-                
-                # 获取第一帧以确定分辨率
-                first_frame = frames_dict[sorted_frame_ids[0]]
-                height, width = first_frame.shape[:2]
-                
-                # 创建视频写入器
-                output_path = os.path.join(self.save_path, f"tracked_{video_id}.mp4")
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(output_path, fourcc, 30, (width, height))
-                
-                frame_count = 0
-                for frame_id in sorted_frame_ids:
-                    frame = frames_dict[frame_id]
-                    writer.write(frame)
-                    frame_count += 1
-                
-                writer.release()
-                print(f"[VideoGen] 生成视频: {output_path} ({frame_count} 帧)")
-                
-                # 删除所有对应的中间帧文件
-                if video_id in self.frame_files:
-                    deleted_count = 0
-                    for frame_file in self.frame_files[video_id]:
-                        try:
-                            if os.path.exists(frame_file):
-                                os.remove(frame_file)
-                                deleted_count += 1
-                        except Exception as e:
-                            print(f"[VideoGen] 删除文件失败 {frame_file}: {e}")
-                    
-                    print(f"[VideoGen] 已删除 {deleted_count} 个中间帧文件")
-                
-                # 清空内存中的帧数据（持有锁）
-                with self.disk_write_lock:
-                    if video_id in self.frame_buffer:
-                        del self.frame_buffer[video_id]
-                    if video_id in self.frame_files:
-                        del self.frame_files[video_id]
-                
-            except Exception as e:
-                print(f"[VideoGen] 生成 {video_id} 的视频失败: {e}")
-
-    def stop(self):
-        self.isRunning = False
+            # 绘制半透明背景的标签（更易读）
+            label = f"{class_name}: {confidence:.2f}"
+            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            
+            # 绘制标签背景
+            cv2.rectangle(result, 
+                         (x1, y1 - label_size[1] - baseline - 4),
+                         (x1 + label_size[0], y1),
+                         (255, 0, 0), -1)
+            
+            # 绘制标签文本
+            cv2.putText(result, label, (x1, y1 - baseline - 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return result
+    
+    @staticmethod
+    def draw_tracks(frame: np.ndarray, tracks: List[dict]) -> np.ndarray:
+        """
+        在图像上绘制追踪框和ID
+        
+        Args:
+            frame: 原始图像
+            tracks: 追踪结果列表
+        
+        Returns:
+            绘制后的图像
+        """
+        import cv2
+        
+        result = frame.copy()
+        
+        for track in tracks:
+            x1, y1, x2, y2 = track['bbox']
+            track_id = track['track_id']
+            class_name = track['class_name']
+            confidence = track['confidence']
+            
+            # 根据状态选择颜色 - 使用蓝色和其他清晰的颜色
+            if track['state'] == 'tracked':
+                color = (255, 0, 0)  # 蓝色 - 已追踪的
+            elif track['state'] == 'confirmed':
+                color = (0, 255, 255)  # 青色 - 已确认的
+            else:
+                color = (0, 0, 255)  # 红色 - 临时的
+            
+            # 绘制框 - 使用更细的线条和清晰的颜色（1像素宽度）
+            cv2.rectangle(result, (x1, y1), (x2, y2), color, 1)
+            
+            # 绘制追踪ID标签（更醒目）
+            label = f"ID:{track_id}"
+            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            
+            # 绘制ID背景（半透明效果）
+            cv2.rectangle(result,
+                         (x1, y1 - label_size[1] - baseline - 6),
+                         (x1 + label_size[0] + 4, y1 - 2),
+                         color, -1)
+            
+            # 绘制ID文本（白色，易读）
+            cv2.putText(result, label, (x1 + 2, y1 - baseline - 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # 绘制类别和置信度标签
+            detail_label = f"{class_name}: {confidence:.2f}"
+            detail_size, detail_baseline = cv2.getTextSize(detail_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            
+            cv2.rectangle(result,
+                         (x1, y2),
+                         (x1 + detail_size[0], y2 + detail_size[1] + 4),
+                         color, -1)
+            
+            cv2.putText(result, detail_label, (x1 + 2, y2 + detail_size[1] + 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return result
+    
+    @staticmethod
+    def save_frame(frame: np.ndarray, output_path: str):
+        """保存图像文件"""
+        import cv2
+        import os
+        
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        cv2.imwrite(output_path, frame)

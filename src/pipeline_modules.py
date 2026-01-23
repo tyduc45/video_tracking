@@ -57,7 +57,7 @@ class Reader:
                 
                 if not ret or frame is None:
                     logger.info(f"[{self.pipeline_id}] Reached end of video")
-                    self.stop_event.set()
+                    # 注意：不要设置全局 stop_event，只是本视频结束
                     break
                 
                 frame_id += 1
@@ -205,14 +205,11 @@ class Tracker:
                     # 执行追踪
                     start_time = time.time()
                     
-                    # 执行YOLO原生追踪
-                    # 使用persist=True确保追踪ID的帧间一致性
-                    if frame_data.frame is not None:
-                        # 调用ByteTracker (基于YOLO原生track方法)
-                        # 返回的results包含track_id信息
+                    # 执行追踪（如果有tracker）
+                    if frame_data.frame is not None and self.tracker is not None:
                         track_results = self.tracker.update(frame_data.frame)
-                        # 将YOLO追踪结果存储在detections中
-                        # 这样后续的可视化就能使用results.plot()自动显示追踪框和ID
+                        # 只有当追踪返回有效结果时才覆盖
+                        # PassthroughTracker 返回 None，保留已有的 detections
                         if track_results is not None:
                             frame_data.detections = track_results
                     

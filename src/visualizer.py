@@ -127,7 +127,11 @@ class PipelineOutputHandler:
     
     def process_frame(self, frame_data: FrameData):
         """
-        处理一帧数据，使用YOLO原生plot方法可视化
+        处理一帧数据，可视化检测结果
+        
+        支持两种 detections 格式：
+        1. YOLO 结果对象（有 .plot() 方法）- 传统模式
+        2. List[dict] 格式 - 批处理模式
         
         Args:
             frame_data: Pipeline传递的帧数据
@@ -135,10 +139,9 @@ class PipelineOutputHandler:
         try:
             output_frame = frame_data.frame.copy()
             
-            # 使用 YOLO 原生的 plot() 方法绘制检测框和追踪ID
-            # 这个方法会自动处理 boxes 和 track_id 的绘制，确保帧间一致性
+            # 绘制检测框
             if frame_data.detections and self.draw_boxes:
-                output_frame = frame_data.detections.plot()
+                output_frame = self._draw_detections(output_frame, frame_data.detections)
             
             # 添加帧信息
             frame_info_text = f"Frame: {frame_data.frame_id}"
@@ -155,6 +158,58 @@ class PipelineOutputHandler:
         
         except Exception as e:
             logger.error(f"Error processing frame: {e}")
+    
+    def _draw_detections(self, frame: np.ndarray, detections) -> np.ndarray:
+        """
+        绘制检测结果
+        
+        支持两种格式：
+        1. YOLO 结果对象 -> 使用原生 plot() 方法
+        2. List[dict] -> 手动绘制
+        """
+        # 检查是否是 YOLO 结果对象（有 plot 方法）
+        if hasattr(detections, 'plot'):
+            return detections.plot()
+        
+        # 否则是 List[dict] 格式，手动绘制
+        if isinstance(detections, list):
+            for det in detections:
+                if not isinstance(det, dict):
+                    continue
+                
+                bbox = det.get('bbox', [])
+                if len(bbox) < 4:
+                    continue
+                
+                x1, y1, x2, y2 = bbox[:4]
+                class_name = det.get('class_name', 'unknown')
+                confidence = det.get('confidence', 0)
+                track_id = det.get('track_id', None)
+                
+                # 绘制边界框
+                color = (0, 255, 0)  # 绿色
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                
+                # 绘制标签
+                label = f"{class_name}"
+                if self.draw_confidence:
+                    label += f" {confidence:.2f}"
+                if self.draw_ids and track_id is not None:
+                    label += f" ID:{track_id}"
+                
+                # 标签背景
+                (text_width, text_height), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame, 
+                            (int(x1), int(y1) - text_height - 5),
+                            (int(x1) + text_width, int(y1)),
+                            color, -1)
+                
+                # 绘制文字
+                cv2.putText(frame, label, (int(x1), int(y1) - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        return frame
     
     def _save_frame(self, frame_data: FrameData, output_frame: np.ndarray):
         """保存单个帧"""

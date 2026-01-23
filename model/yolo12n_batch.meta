@@ -1,8 +1,14 @@
 {
   "model_name": "yolo12n",
-  "batch_size": 16,
+  "batch_size": 32,
   "use_half": true,
-  "input_size": [640, 640],
+  "input_size": [
+    640,
+    640
+  ],
   "framework": "yolov8",
-  "description": "YOLO v8 Nano model with batch processing support"
+  "description": "YOLO v8 Nano model with batch processing support",
+  "engine_batch_size": 32,
+  "last_request_batch_size": 32,
+  "engine_export_time": "2026-01-23 17:46:32"
 }

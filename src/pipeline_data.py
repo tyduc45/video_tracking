@@ -18,6 +18,9 @@ class FrameData:
     video_id: str                      # 视频源ID
     video_name: str                    # 视频源名称
     
+    # 批处理相关
+    video_index: int = 0               # 视频索引（用于批处理系统）
+    
     # 推理结果
     detections: Optional[List[Any]] = None  # YOLO检测结果
     

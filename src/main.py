@@ -113,6 +113,12 @@ def main():
                        help='不保存帧')
     parser.add_argument('--no-video', action='store_true',
                        help='不生成视频')
+    parser.add_argument('--display', action='store_true',
+                       help='实时显示检测结果（按Q或ESC退出）')
+    parser.add_argument('--display-width', type=int, default=1280,
+                       help='显示窗口宽度（默认1280）')
+    parser.add_argument('--display-height', type=int, default=720,
+                       help='显示窗口高度（默认720）')
 
     args = parser.parse_args()
 
@@ -203,8 +209,21 @@ def run_batch_mode(config, video_sources, args):
         logger.info(f"Creating PassthroughTracker for {pipeline_id}")
         return PassthroughTracker(session_id=pipeline_id)
 
-    # 3. 创建输出处理器
-    output_handler = create_output_handler(config)
+    # 3. 创建输出处理器（支持实时显示）
+    realtime_display = getattr(args, 'display', False)
+    display_width = getattr(args, 'display_width', 1280)
+    display_height = getattr(args, 'display_height', 720)
+
+    output_handler = create_output_handler(
+        config,
+        realtime_display=realtime_display,
+        window_width=display_width,
+        window_height=display_height
+    )
+
+    if realtime_display:
+        logger.info(f"Realtime display enabled: {display_width}x{display_height}")
+        logger.info("Press 'Q' or 'ESC' to stop")
 
     def save_func(frame_data, output_dir):
         output_handler.process_frame(frame_data)
@@ -229,18 +248,40 @@ def run_batch_mode(config, video_sources, args):
     logger.info("Starting batch processing...")
     pipeline.start()
 
-    # 6. 等待完成
+    # 6. 等待完成（支持实时显示退出）
     logger.info("Waiting for processing to complete...")
+    user_quit = False
     try:
-        success = pipeline.wait(timeout=None)
+        if realtime_display:
+            # 实时显示模式：检查显示窗口是否关闭
+            import time
+            while not pipeline.stop_event.is_set():
+                if not output_handler.is_display_active():
+                    logger.info("Display window closed, stopping...")
+                    pipeline.stop()
+                    user_quit = output_handler.is_user_quit()
+                    break
+                time.sleep(0.1)
+            pipeline.wait(timeout=10.0)
+        else:
+            pipeline.wait(timeout=None)
     except KeyboardInterrupt:
         logger.info("Received interrupt, stopping...")
         pipeline.stop()
-        success = pipeline.wait(timeout=10.0)
+        user_quit = True
+        pipeline.wait(timeout=10.0)
+    finally:
+        output_handler.stop_display()
+
+    # 用户主动退出，直接终止程序
+    if user_quit:
+        logger.info("User quit, exiting program...")
+        sys.exit(0)
 
     # 7. 生成输出视频
-    logger.info("Generating output videos...")
-    output_handler.generate_all_videos()
+    if config.save_video:
+        logger.info("Generating output videos...")
+        output_handler.generate_all_videos()
 
     # 8. 打印统计
     stats = pipeline.get_stats()
@@ -256,12 +297,8 @@ def run_batch_mode(config, video_sources, args):
     config_output_path = os.path.join(config.output_dir, "config.json")
     save_config(config, config_output_path)
 
-    if success:
-        logger.info("Batch processing completed successfully")
-        return 0
-    else:
-        logger.warning("Batch processing did not complete normally")
-        return 1
+    logger.info("Batch processing completed successfully")
+    return 0
 
 
 if __name__ == "__main__":

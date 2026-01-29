@@ -122,6 +122,30 @@ class ResultDistributor:
         """将推理结果按视频分发"""
         result_dict: Dict[int, List[Any]] = {i: [] for i in range(self.num_videos)}
 
+        # 健壮性校验：确保 detections 数量与预期一致
+        expected_len = sum(actual_k_values)
+        meta_len = len(frame_metas)
+        det_len  = len(detections)
+
+        if meta_len != expected_len or det_len != expected_len:
+            logger.error(f"Count mismatch: expected {expected_len}, frame_metas {meta_len}, detections {det_len}")
+        
+        # 仅仅判断有画面+元数据的帧，取三者交集
+        safe_len = min(expected_len,meta_len,det_len)
+        frame_metas = frame_metas[:safe_len]
+        detections = detections[:safe_len]
+
+        if safe_len < expected_len:
+            remaining = safe_len
+            for i in range(len(actual_k_values)):
+                if remaining <= 0:
+                    actual_k_values[i] = 0
+                elif actual_k_values[i] <= remaining:
+                    remaining -= actual_k_values[i]
+                else:
+                    actual_k_values[i] = remaining
+                    remaining = 0
+
         head = 0
         for video_idx, offset in enumerate(actual_k_values):
             if offset == 0:

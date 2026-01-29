@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(dir:*)",
+      "WebSearch",
+      "WebFetch(domain:supervision.roboflow.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:blog.roboflow.com)"
     ]
   }
 }

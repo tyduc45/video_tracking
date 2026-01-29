@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from video_source import LocalVideoSource, WebcamSource
 from config import load_config, save_config, Config
-from inference import YOLOInferencer, PassthroughTracker
+from inference import YOLOInferencer, PassthroughTracker, ByteTrackTracker
 from visualizer import create_output_handler
 
 # 设置日志
@@ -204,10 +204,10 @@ def run_batch_mode(config, video_sources, args):
         logger.error(f"Failed to load inference model: {e}")
         return 1
 
-    # 2. 创建透传追踪器工厂
+    # 2. 创建 ByteTrack 追踪器工厂
     def tracker_factory(pipeline_id: str):
-        logger.info(f"Creating PassthroughTracker for {pipeline_id}")
-        return PassthroughTracker(session_id=pipeline_id)
+        logger.info(f"Creating ByteTrackTracker for {pipeline_id}")
+        return ByteTrackTracker(session_id=pipeline_id)
 
     # 3. 创建输出处理器（支持实时显示）
     realtime_display = getattr(args, 'display', False)

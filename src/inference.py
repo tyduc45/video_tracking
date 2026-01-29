@@ -8,6 +8,7 @@ import json
 import os
 from typing import List, Optional, Dict, Any
 import time
+import supervision as sv
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +289,98 @@ class PassthroughTracker:
         self.frame_count = 0
         logger.info(f"PassthroughTracker created: {session_id}")
 
-    def update(self, frame: np.ndarray) -> Optional[any]:
+    def update(self, frame: np.ndarray, detections: List[dict] = None) -> Optional[List[dict]]:
         """透传更新 - 不执行实际追踪"""
         self.frame_count += 1
         return None
+
+
+class ByteTrackTracker:
+    """
+    ByteTrack 追踪器 - 使用 supervision 库的 ByteTrack 算法
+
+    接收带有检测框的帧，为每个检测添加 track_id
+    """
+
+    def __init__(self, session_id: str = "bytetrack",
+                 track_thresh: float = 0.25,
+                 track_buffer: int = 30,
+                 match_thresh: float = 0.8,
+                 frame_rate: int = 30):
+        self.session_id = session_id
+        self.frame_count = 0
+
+        try:
+            import supervision as sv
+            self.sv = sv
+            self.tracker = sv.ByteTrack(
+                track_activation_threshold=track_thresh,
+                lost_track_buffer=track_buffer,
+                minimum_matching_threshold=match_thresh,
+                frame_rate=frame_rate
+            )
+            logger.info(f"ByteTrackTracker created: {session_id}")
+        except ImportError:
+            logger.error("supervision package not found. Install it with: pip install supervision")
+            raise
+
+    def update(self, frame: np.ndarray, detections: List[dict] = None) -> Optional[List[dict]]:
+        """
+        使用 ByteTrack 进行追踪
+
+        Args:
+            frame: 原始帧图像 (BGR格式)
+            detections: 检测结果列表，每个元素包含 bbox, confidence, class_id 等
+
+        Returns:
+            添加了 track_id 的检测结果列表
+        """
+        self.frame_count += 1
+
+        if detections is None or len(detections) == 0:
+            return detections
+
+        # 将 dict 列表转换为 supervision.Detections
+        xyxy = []
+        confidence = []
+        class_id = []
+        class_names = []
+
+        for det in detections:
+            bbox = det.get('bbox', [])
+            if len(bbox) >= 4:
+                xyxy.append(bbox[:4])
+                confidence.append(det.get('confidence', 0.0))
+                class_id.append(det.get('class_id', 0))
+                class_names.append(det.get('class_name', 'unknown'))
+
+        if len(xyxy) == 0:
+            return detections
+
+        # 创建 supervision.Detections 对象，使用 data 字段保存 class_name
+        sv_detections = self.sv.Detections(
+            xyxy=np.array(xyxy, dtype=np.float32),
+            confidence=np.array(confidence, dtype=np.float32),
+            class_id=np.array(class_id, dtype=int),
+            data={'class_name': np.array(class_names)}
+        )
+
+        # 使用 ByteTrack 进行追踪
+        tracked_detections = self.tracker.update_with_detections(sv_detections)
+
+        # 从 tracked_detections 构建返回结果
+        result = []
+        tracked_class_names = tracked_detections.data.get('class_name', [])
+
+        for i in range(len(tracked_detections.xyxy)):
+            det = {
+                'bbox': tracked_detections.xyxy[i].astype(int).tolist(),
+                'confidence': float(tracked_detections.confidence[i]),
+                'class_id': int(tracked_detections.class_id[i]),
+                'class_name': str(tracked_class_names[i]) if i < len(tracked_class_names) else 'unknown',
+            }
+            if tracked_detections.tracker_id is not None:
+                det['track_id'] = int(tracked_detections.tracker_id[i])
+            result.append(det)
+
+        return result

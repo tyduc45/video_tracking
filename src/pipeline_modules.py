@@ -112,7 +112,7 @@ class Tracker:
                     start_time = time.time()
 
                     if frame_data.frame is not None and self.tracker is not None:
-                        track_results = self.tracker.update(frame_data.frame)
+                        track_results = self.tracker.update(frame_data.frame, frame_data.detections)
                         if track_results is not None:
                             frame_data.detections = track_results
 

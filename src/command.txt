@@ -1,0 +1,3 @@
+python main.py -i ../videos/video0.mp4 ../videos/video01.mp4 ../videos/video00.mp4 ../videos.video1.mp4 --device cuda --no-frame --no-video --display
+
+ 

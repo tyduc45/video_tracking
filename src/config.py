@@ -37,6 +37,11 @@ class Config:
     draw_boxes: bool = True
     draw_ids: bool = True
     draw_confidence: bool = True
+    draw_trajectory: bool = True
+    trajectory_length: int = 30
+    trajectory_gap_timeout: float = 3.0  # 同一ID两次记录间隔超过此值（秒）则丢弃历史重新开始
+    trajectory_expire_timeout: float = 3.0  # ID长时间无更新超过此值（秒）则丢弃整个轨迹
+    trajectory_point_expire_timeout: float = 10.0  # 单个轨迹点超过此值（秒）后被删除
 
     # 日志配置
     log_level: str = "INFO"
@@ -100,6 +105,11 @@ class Config:
             'draw_boxes': self.draw_boxes,
             'draw_ids': self.draw_ids,
             'draw_confidence': self.draw_confidence,
+            'draw_trajectory': self.draw_trajectory,
+            'trajectory_length': self.trajectory_length,
+            'trajectory_gap_timeout': self.trajectory_gap_timeout,
+            'trajectory_expire_timeout': self.trajectory_expire_timeout,
+            'trajectory_point_expire_timeout': self.trajectory_point_expire_timeout,
             'log_level': self.log_level,
             'log_file': self.log_file,
         }

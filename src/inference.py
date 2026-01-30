@@ -54,7 +54,7 @@ class YOLOInferencer:
             "batch_size": 16,
             "use_half": True,
             "input_size": [640, 640],
-            "framework": "yolov8",
+            "framework": "yolo12",
             "engine_batch_size": None,
             "last_request_batch_size": None,
         }

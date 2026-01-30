@@ -6,13 +6,190 @@ import cv2
 import os
 import logging
 import threading
-from typing import Tuple, Optional
+import time
+from typing import Tuple, Optional, Dict, List
+from dataclasses import dataclass, field
 from queue import Queue, Empty
 import numpy as np
 
 from pipeline_data import FrameData
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrackPoint:
+    """轨迹点，包含坐标和时间戳"""
+    x: float
+    y: float
+    timestamp: float
+
+
+@dataclass
+class TrackRecord:
+    """单个 track_id 的轨迹记录"""
+    points: List[TrackPoint] = field(default_factory=list)
+    last_update_time: float = 0.0
+
+
+class TrajectoryManager:
+    """
+    自定义轨迹管理器
+
+    对于每个视频维护一个字典 dict[int, TrackRecord]：
+    - int: track_id
+    - TrackRecord: 包含坐标列表和最后更新时间
+
+    逻辑：
+    1. 每帧遍历所有 detection，获取 track_id 和坐标
+    2. 新 id：创建新条目，记录坐标和时间
+    3. 老 id：计算与上次记录的时间差
+       - 时间差 > gap_timeout：丢弃历史，重新开始
+       - 时间差 <= gap_timeout：添加坐标
+    4. 清理逻辑：
+       - 每个点根据自身时间戳超时后被删除
+       - 整个 track 长时间无更新后被删除
+    """
+
+    def __init__(self,
+                 gap_timeout: float = 3.0,
+                 expire_timeout: float = 3.0,
+                 point_expire_timeout: float = 10.0,
+                 color_palette=None):
+        """
+        Args:
+            gap_timeout: 同一ID两次记录间隔超过此值（秒）则丢弃历史重新开始
+            expire_timeout: ID长时间无更新超过此值（秒）则丢弃整个轨迹
+            point_expire_timeout: 单个轨迹点超过此值（秒）后被删除
+            color_palette: supervision.ColorPalette 实例，用于保持颜色一致
+        """
+        self.gap_timeout = gap_timeout
+        self.expire_timeout = expire_timeout
+        self.point_expire_timeout = point_expire_timeout
+        self.color_palette = color_palette
+
+        # dict[track_id, TrackRecord]
+        self.tracks: Dict[int, TrackRecord] = {}
+
+    def _get_color(self, track_id: int) -> Tuple[int, int, int]:
+        """根据 track_id 获取颜色，与 supervision 检测框颜色一致"""
+        if self.color_palette is not None:
+            color = self.color_palette.by_idx(track_id)
+            # supervision Color 对象的 as_bgr() 返回 BGR 元组
+            return color.as_bgr()
+        # 备用颜色（不应该走到这里）
+        fallback_colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 0, 0), (0, 128, 0),
+        ]
+        return fallback_colors[track_id % len(fallback_colors)]
+
+    def update(self, detections: list, current_time: Optional[float] = None):
+        """
+        更新轨迹
+
+        Args:
+            detections: 检测结果列表，每个元素是 dict，包含 'track_id', 'bbox' 等
+            current_time: 当前时间戳，如果为 None 则使用 time.time()
+        """
+        if current_time is None:
+            current_time = time.time()
+
+        # 记录本帧出现的所有 track_id
+        current_ids = set()
+
+        for det in detections:
+            if not isinstance(det, dict):
+                continue
+
+            track_id = det.get('track_id')
+            if track_id is None or track_id < 0:
+                continue
+
+            bbox = det.get('bbox', [])
+            if len(bbox) < 4:
+                continue
+
+            current_ids.add(track_id)
+
+            # 计算目标底部中心点作为轨迹点
+            x1, y1, x2, y2 = bbox[:4]
+            center_x = (x1 + x2) / 2
+            bottom_y = y2  # 使用底部中心
+
+            point = TrackPoint(x=center_x, y=bottom_y, timestamp=current_time)
+
+            if track_id not in self.tracks:
+                # 新 ID，创建新记录
+                self.tracks[track_id] = TrackRecord(
+                    points=[point],
+                    last_update_time=current_time
+                )
+            else:
+                record = self.tracks[track_id]
+                time_gap = current_time - record.last_update_time
+
+                if time_gap > self.gap_timeout:
+                    # 时间间隔过大，丢弃历史，重新开始
+                    record.points = [point]
+                    record.last_update_time = current_time
+                else:
+                    # 正常添加，点留存在屏幕上直到超时
+                    record.points.append(point)
+                    record.last_update_time = current_time
+
+        # 清理过期的轨迹（长时间没有更新的 ID）
+        self._cleanup_expired(current_time)
+
+    def _cleanup_expired(self, current_time: float):
+        """清理过期的轨迹和点"""
+        expired_ids = []
+
+        for track_id, record in self.tracks.items():
+            # 清理单个超时的点（保留未超时的点）
+            record.points = [
+                p for p in record.points
+                if current_time - p.timestamp <= self.point_expire_timeout
+            ]
+
+            # 如果整个 track 长时间无更新，或者所有点都被清理了，删除整个 track
+            if (current_time - record.last_update_time > self.expire_timeout
+                    or len(record.points) == 0):
+                expired_ids.append(track_id)
+
+        for track_id in expired_ids:
+            del self.tracks[track_id]
+
+    def draw(self, frame: np.ndarray, thickness: int = 2) -> np.ndarray:
+        """
+        在帧上绘制所有轨迹
+
+        Args:
+            frame: 输入帧
+            thickness: 线条粗细
+
+        Returns:
+            绘制了轨迹的帧
+        """
+        result = frame.copy()
+
+        for track_id, record in self.tracks.items():
+            if len(record.points) < 2:
+                continue
+
+            color = self._get_color(track_id)
+
+            # 连接所有相邻的点
+            for i in range(1, len(record.points)):
+                pt1 = (int(record.points[i-1].x), int(record.points[i-1].y))
+                pt2 = (int(record.points[i].x), int(record.points[i].y))
+                cv2.line(result, pt1, pt2, color, thickness)
+
+        return result
+
+    def clear(self):
+        """清空所有轨迹"""
+        self.tracks.clear()
 
 
 class RealtimeDisplay:
@@ -313,7 +490,7 @@ class VideoGenerator:
 
 
 class PipelineOutputHandler:
-    """Pipeline输出处理器 - 保存结果帧、生成视频、实时显示"""
+    """Pipeline输出处理器 - 使用 supervision 注解器进行可视化"""
 
     def __init__(self, output_dir: str = "result",
                  save_frames: bool = True,
@@ -321,6 +498,11 @@ class PipelineOutputHandler:
                  draw_boxes: bool = True,
                  draw_ids: bool = True,
                  draw_confidence: bool = True,
+                 draw_trajectory: bool = True,
+                 trajectory_length: int = 30,
+                 trajectory_gap_timeout: float = 3.0,
+                 trajectory_expire_timeout: float = 3.0,
+                 trajectory_point_expire_timeout: float = 10.0,
                  fps: float = 30.0,
                  realtime_display: bool = False,
                  window_width: int = 1280,
@@ -331,11 +513,23 @@ class PipelineOutputHandler:
         self.draw_boxes = draw_boxes
         self.draw_ids = draw_ids
         self.draw_confidence = draw_confidence
+        self.draw_trajectory = draw_trajectory
+        self.trajectory_length = trajectory_length
+        self.trajectory_gap_timeout = trajectory_gap_timeout
+        self.trajectory_expire_timeout = trajectory_expire_timeout
+        self.trajectory_point_expire_timeout = trajectory_point_expire_timeout
         self.fps = fps
         self.realtime_display = realtime_display
 
         self.frame_info = {}
         self.video_generator = VideoGenerator(fps=fps)
+
+        # 初始化 supervision 注解器
+        self._init_annotators()
+
+        # 自定义轨迹管理器，每个视频一个
+        # {video_id: TrajectoryManager}
+        self.trajectory_managers: Dict[str, TrajectoryManager] = {}
 
         # 实时显示器
         self.display: Optional[RealtimeDisplay] = None
@@ -347,13 +541,53 @@ class PipelineOutputHandler:
             )
             self.display.start()
 
+    def _init_annotators(self):
+        """初始化 supervision 注解器"""
+        import supervision as sv
+        self.sv = sv
+
+        # 颜色按 track_id 分配
+        self.color_lookup = sv.ColorLookup.TRACK
+
+        # 检测框注解器（无状态，可共享）
+        self.box_annotator = sv.RoundBoxAnnotator(
+            color=sv.ColorPalette.DEFAULT,
+            thickness=2,
+            color_lookup=self.color_lookup
+        )
+
+        # 标签注解器（无状态，可共享）
+        self.label_annotator = sv.LabelAnnotator(
+            color=sv.ColorPalette.DEFAULT,
+            text_color=sv.Color.BLACK,
+            text_scale=0.5,
+            text_thickness=1,
+            text_padding=5,
+            color_lookup=self.color_lookup
+        )
+
+        logger.info("Supervision annotators initialized")
+
+    def _get_trajectory_manager(self, video_id: str) -> TrajectoryManager:
+        """获取指定视频的轨迹管理器（懒加载）"""
+        if video_id not in self.trajectory_managers:
+            self.trajectory_managers[video_id] = TrajectoryManager(
+                gap_timeout=self.trajectory_gap_timeout,
+                expire_timeout=self.trajectory_expire_timeout,
+                point_expire_timeout=self.trajectory_point_expire_timeout,
+                color_palette=self.sv.ColorPalette.DEFAULT
+            )
+        return self.trajectory_managers[video_id]
+
     def process_frame(self, frame_data: FrameData):
         """处理一帧数据，可视化检测结果"""
         try:
             output_frame = frame_data.frame.copy()
 
             if frame_data.detections and self.draw_boxes:
-                output_frame = self._draw_detections(output_frame, frame_data.detections)
+                output_frame = self._draw_detections(
+                    output_frame, frame_data.detections, frame_data.video_id
+                )
 
             frame_info_text = f"{frame_data.video_id} Frame: {frame_data.frame_id}"
             cv2.putText(output_frame, frame_info_text, (10, 30),
@@ -389,45 +623,108 @@ class PipelineOutputHandler:
             return self.display.user_quit.is_set()
         return False
 
-    def _draw_detections(self, frame: np.ndarray, detections) -> np.ndarray:
-        """绘制检测结果"""
+    def _detections_to_sv(self, detections: list):
+        """将检测结果列表转换为 supervision.Detections 对象"""
+        if not detections:
+            return self.sv.Detections.empty()
+
+        xyxy = []
+        confidence = []
+        class_id = []
+        tracker_id = []
+        class_names = []
+
+        for det in detections:
+            if not isinstance(det, dict):
+                continue
+
+            bbox = det.get('bbox', [])
+            if len(bbox) < 4:
+                continue
+
+            xyxy.append(bbox[:4])
+            confidence.append(det.get('confidence', 0.0))
+            class_id.append(det.get('class_id', 0))
+            class_names.append(det.get('class_name', 'unknown'))
+
+            tid = det.get('track_id')
+            tracker_id.append(tid if tid is not None else -1)
+
+        if not xyxy:
+            return self.sv.Detections.empty()
+
+        # 构建 Detections 对象
+        return self.sv.Detections(
+            xyxy=np.array(xyxy, dtype=np.float32),
+            confidence=np.array(confidence, dtype=np.float32),
+            class_id=np.array(class_id, dtype=int),
+            tracker_id=np.array(tracker_id, dtype=int),
+            data={'class_name': np.array(class_names)}
+        )
+
+    def _build_labels(self, detections) -> list:
+        """构建标签列表"""
+        labels = []
+        class_names = detections.data.get('class_name', [])
+
+        for i in range(len(detections.xyxy)):
+            class_name = class_names[i] if i < len(class_names) else 'unknown'
+            label = f"{class_name}"
+
+            if self.draw_confidence and detections.confidence is not None:
+                label += f" {detections.confidence[i]:.2f}"
+
+            if self.draw_ids and detections.tracker_id is not None:
+                tid = detections.tracker_id[i]
+                if tid >= 0:
+                    label += f" #{tid}"
+
+            labels.append(label)
+
+        return labels
+
+    def _draw_detections(self, frame: np.ndarray, detections, video_id: str = "default") -> np.ndarray:
+        """使用 supervision 注解器绘制检测结果和自定义轨迹"""
+        # 如果是 ultralytics 的原生结果，直接使用其 plot 方法
         if hasattr(detections, 'plot'):
             return detections.plot()
 
-        if isinstance(detections, list):
-            for det in detections:
-                if not isinstance(det, dict):
-                    continue
+        if not isinstance(detections, list) or not detections:
+            return frame
 
-                bbox = det.get('bbox', [])
-                if len(bbox) < 4:
-                    continue
+        # 转换为 supervision.Detections
+        sv_detections = self._detections_to_sv(detections)
 
-                x1, y1, x2, y2 = bbox[:4]
-                class_name = det.get('class_name', 'unknown')
-                confidence = det.get('confidence', 0)
-                track_id = det.get('track_id', None)
+        if len(sv_detections.xyxy) == 0:
+            return frame
 
-                color = (0, 255, 0)
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+        annotated_frame = frame.copy()
 
-                label = f"{class_name}"
-                if self.draw_confidence:
-                    label += f" {confidence:.2f}"
-                if self.draw_ids and track_id is not None:
-                    label += f" ID:{track_id}"
+        # 使用自定义轨迹管理器绘制轨迹（需要在检测框之前绘制，这样轨迹在框下面）
+        if self.draw_trajectory:
+            trajectory_manager = self._get_trajectory_manager(video_id)
+            # 更新轨迹（传入原始 detections 列表）
+            trajectory_manager.update(detections)
+            # 绘制轨迹
+            annotated_frame = trajectory_manager.draw(annotated_frame, thickness=2)
 
-                (text_width, text_height), _ = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame,
-                            (int(x1), int(y1) - text_height - 5),
-                            (int(x1) + text_width, int(y1)),
-                            color, -1)
+        # 绘制检测框
+        if self.draw_boxes:
+            annotated_frame = self.box_annotator.annotate(
+                scene=annotated_frame,
+                detections=sv_detections
+            )
 
-                cv2.putText(frame, label, (int(x1), int(y1) - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        # 绘制标签
+        if self.draw_ids or self.draw_confidence:
+            labels = self._build_labels(sv_detections)
+            annotated_frame = self.label_annotator.annotate(
+                scene=annotated_frame,
+                detections=sv_detections,
+                labels=labels
+            )
 
-        return frame
+        return annotated_frame
 
     def _save_frame(self, frame_data: FrameData, output_frame: np.ndarray):
         """保存单个帧"""
@@ -509,6 +806,11 @@ def create_output_handler(config, realtime_display: bool = False,
         draw_boxes=config.draw_boxes,
         draw_ids=config.draw_ids,
         draw_confidence=config.draw_confidence,
+        draw_trajectory=getattr(config, 'draw_trajectory', True),
+        trajectory_length=getattr(config, 'trajectory_length', 30),
+        trajectory_gap_timeout=getattr(config, 'trajectory_gap_timeout', 3.0),
+        trajectory_expire_timeout=getattr(config, 'trajectory_expire_timeout', 3.0),
+        trajectory_point_expire_timeout=getattr(config, 'trajectory_point_expire_timeout', 10.0),
         fps=config.save_fps,
         realtime_display=realtime_display,
         window_width=window_width,

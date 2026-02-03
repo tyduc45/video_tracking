@@ -19,8 +19,8 @@ class Config:
 
     # 推理配置
     device: str = "cpu"
-    confidence_threshold: float = 0.5
-    iou_threshold: float = 0.45
+    confidence_threshold: float = 0.25
+    iou_threshold: float = 0.65
     batch_size: int = 32
 
     # Pipeline配置

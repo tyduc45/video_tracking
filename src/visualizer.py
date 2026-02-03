@@ -192,6 +192,69 @@ class TrajectoryManager:
         self.tracks.clear()
 
 
+class PolygonZone:
+    """单个视频的多边形区域及计数器"""
+
+    def __init__(self, points: List[Tuple[int, int]]):
+        self.points = points          # 多边形顶点列表 (视频本地坐标)
+        self.inside_ids: set = set()  # 当前在区域内的 track_id 集合
+        self.count: int = 0           # 当前区域内目标数
+
+    def point_in_polygon(self, x: float, y: float) -> bool:
+        """射线法判断点是否在多边形内"""
+        n = len(self.points)
+        if n < 3:
+            return False
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = self.points[i]
+            xj, yj = self.points[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def update(self, detections: list):
+        """每帧更新: 遍历检测框, 计算中心点, 判断进出"""
+        current_inside = set()
+        for det in detections:
+            if not isinstance(det, dict):
+                continue
+            track_id = det.get('track_id')
+            if track_id is None or track_id < 0:
+                continue
+            bbox = det.get('bbox', [])
+            if len(bbox) < 4:
+                continue
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            if self.point_in_polygon(cx, cy):
+                current_inside.add(track_id)
+        self.count = len(current_inside)
+        self.inside_ids = current_inside
+
+    def draw(self, frame: np.ndarray) -> np.ndarray:
+        """在帧上绘制多边形轮廓 + 计数文字"""
+        if len(self.points) < 3:
+            return frame
+        result = frame.copy()
+        pts = np.array(self.points, dtype=np.int32).reshape((-1, 1, 2))
+        # 半透明填充
+        overlay = result.copy()
+        cv2.fillPoly(overlay, [pts], (0, 255, 0))
+        cv2.addWeighted(overlay, 0.2, result, 0.8, 0, result)
+        # 轮廓线
+        cv2.polylines(result, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+        # 计数文字 - 放在多边形顶部
+        min_x = min(p[0] for p in self.points)
+        min_y = min(p[1] for p in self.points)
+        text = f"Count: {self.count}"
+        cv2.putText(result, text, (min_x, max(min_y - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        return result
+
+
 class RealtimeDisplay:
     """实时显示器 - 在窗口中实时显示处理结果"""
 
@@ -213,6 +276,16 @@ class RealtimeDisplay:
 
         self.current_frames = {}  # video_id -> latest frame
         self.lock = threading.Lock()
+
+        # 布局追踪: { video_id: { 'x': int, 'y': int, 'w': int, 'h': int, 'scale': float } }
+        self.video_layout: Dict[str, dict] = {}
+
+        # 多边形绘制状态
+        self.drawing = False                    # 是否正在绘制
+        self.drawing_points: List[Tuple[int, int]] = []  # 当前绘制中的点 (画布坐标)
+        self.drawing_video_id: Optional[str] = None      # 当前绘制所属视频
+        self.polygon_zones: Dict[str, PolygonZone] = {}  # video_id -> PolygonZone
+        self.polygon_lock = threading.Lock()
 
     def start(self):
         """启动显示线程"""
@@ -246,6 +319,7 @@ class RealtimeDisplay:
     def _display_loop(self):
         """显示循环"""
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.window_name, self._mouse_callback)
 
         import time
         last_time = time.time()
@@ -279,6 +353,9 @@ class RealtimeDisplay:
                     win_h = int(h * scale)
                     cv2.resizeWindow(self.window_name, win_w, win_h)
                     window_resized = True
+
+                # 绘制多边形覆盖层
+                combined = self._draw_polygon_overlay(combined)
 
                 cv2.imshow(self.window_name, combined)
 
@@ -322,20 +399,23 @@ class RealtimeDisplay:
 
         # 按video_id排序，保证显示顺序一致
         sorted_items = sorted(frames.items(), key=lambda x: x[0])
+        video_ids = [item[0] for item in sorted_items]
         frame_list = [item[1] for item in sorted_items]
         n = len(frame_list)
 
         if n == 1:
-            return self._center_frame_on_canvas(frame_list[0])
+            return self._center_frame_on_canvas(frame_list[0], video_ids[0])
 
         if n == 2:
             # 两个视频：水平并排，保留原始分辨率，垂直居中对齐
-            return self._combine_two_frames(frame_list[0], frame_list[1])
+            return self._combine_two_frames(frame_list[0], frame_list[1],
+                                            video_ids[0], video_ids[1])
 
         # 多于2个视频：使用网格布局
-        return self._combine_grid_frames(frame_list)
+        return self._combine_grid_frames(frame_list, video_ids)
 
-    def _combine_two_frames(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
+    def _combine_two_frames(self, frame1: np.ndarray, frame2: np.ndarray,
+                            vid1: str = "", vid2: str = "") -> np.ndarray:
         """
         并排显示两个视频
         - 保留各自原始分辨率
@@ -347,7 +427,7 @@ class RealtimeDisplay:
 
         # 最大高度
         max_height = max(h1, h2)
-        max_width = max(w1,w2)
+        max_width = max(w1, w2)
         total_width = 2 * max_width
 
         # 创建灰色画布
@@ -356,16 +436,22 @@ class RealtimeDisplay:
         # 放置第一个帧（垂直水平居中）
         y1_offset = (max_height - h1) // 2
         x1_offset = (max_width - w1) // 2
-        canvas[y1_offset:y1_offset + h1, x1_offset:x1_offset+w1] = frame1
+        canvas[y1_offset:y1_offset + h1, x1_offset:x1_offset + w1] = frame1
 
         # 放置第二个帧（垂直水平居中）
         y2_offset = (max_height - h2) // 2
         x2_offset = (max_width - w2) // 2
-        canvas[y2_offset:y2_offset + h2, max_width+x2_offset:max_width + x2_offset + w2] = frame2
+        canvas[y2_offset:y2_offset + h2, max_width + x2_offset:max_width + x2_offset + w2] = frame2
+
+        # 记录布局信息
+        if vid1:
+            self.video_layout[vid1] = {'x': x1_offset, 'y': y1_offset, 'w': w1, 'h': h1, 'scale': 1.0}
+        if vid2:
+            self.video_layout[vid2] = {'x': max_width + x2_offset, 'y': y2_offset, 'w': w2, 'h': h2, 'scale': 1.0}
 
         return canvas
 
-    def _combine_grid_frames(self, frame_list: list) -> np.ndarray:
+    def _combine_grid_frames(self, frame_list: list, video_ids: list = None) -> np.ndarray:
         """
         网格布局显示多个视频
         - 每个单元格内保留原始宽高比
@@ -401,9 +487,15 @@ class RealtimeDisplay:
 
             canvas[y_offset:y_offset + h, x_offset:x_offset + w] = frame
 
+            # 记录布局信息
+            if video_ids and i < len(video_ids):
+                self.video_layout[video_ids[i]] = {
+                    'x': x_offset, 'y': y_offset, 'w': w, 'h': h, 'scale': 1.0
+                }
+
         return canvas
 
-    def _center_frame_on_canvas(self, frame: np.ndarray) -> np.ndarray:
+    def _center_frame_on_canvas(self, frame: np.ndarray, video_id: str = "") -> np.ndarray:
         """将单帧居中放置在灰色画布上"""
         h, w = frame.shape[:2]
 
@@ -432,7 +524,118 @@ class RealtimeDisplay:
         y_offset = (self.window_height - new_h) // 2
         canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
 
+        # 记录布局信息
+        if video_id:
+            self.video_layout[video_id] = {
+                'x': x_offset, 'y': y_offset, 'w': new_w, 'h': new_h, 'scale': scale
+            }
+
         return canvas
+
+    def _canvas_to_video(self, canvas_x: int, canvas_y: int) -> Optional[Tuple[str, int, int]]:
+        """画布坐标 -> (video_id, local_x, local_y)，不在任何视频区域则返回 None"""
+        for video_id, layout in self.video_layout.items():
+            lx = layout['x']
+            ly = layout['y']
+            lw = layout['w']
+            lh = layout['h']
+            scale = layout['scale']
+            if lx <= canvas_x < lx + lw and ly <= canvas_y < ly + lh:
+                # 转换为视频本地坐标（考虑缩放）
+                local_x = int((canvas_x - lx) / scale)
+                local_y = int((canvas_y - ly) / scale)
+                return video_id, local_x, local_y
+        return None
+
+    def _video_to_canvas(self, video_id: str, local_x: int, local_y: int) -> Optional[Tuple[int, int]]:
+        """视频本地坐标 -> 画布坐标，视频不在布局中则返回 None"""
+        layout = self.video_layout.get(video_id)
+        if layout is None:
+            return None
+        scale = layout['scale']
+        canvas_x = int(local_x * scale) + layout['x']
+        canvas_y = int(local_y * scale) + layout['y']
+        return canvas_x, canvas_y
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        """鼠标事件回调"""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # 左键按下：开始绘制
+            result = self._canvas_to_video(x, y)
+            if result is not None:
+                self.drawing = True
+                self.drawing_video_id = result[0]
+                self.drawing_points = [(x, y)]
+
+        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
+            # 拖拽中：追加点
+            self.drawing_points.append((x, y))
+
+        elif event == cv2.EVENT_LBUTTONUP and self.drawing:
+            # 左键松开：完成多边形
+            self.drawing = False
+            if len(self.drawing_points) >= 3 and self.drawing_video_id is not None:
+                # 将画布坐标转换为视频本地坐标
+                local_points = []
+                for cx, cy in self.drawing_points:
+                    result = self._canvas_to_video(cx, cy)
+                    if result is not None and result[0] == self.drawing_video_id:
+                        local_points.append((result[1], result[2]))
+                if len(local_points) >= 3:
+                    zone = PolygonZone(local_points)
+                    with self.polygon_lock:
+                        self.polygon_zones[self.drawing_video_id] = zone
+                    logger.info(f"Polygon zone created for {self.drawing_video_id} "
+                                f"with {len(local_points)} points")
+            self.drawing_points = []
+            self.drawing_video_id = None
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # 右键点击：清除对应视频的多边形
+            result = self._canvas_to_video(x, y)
+            if result is not None:
+                video_id = result[0]
+                with self.polygon_lock:
+                    if video_id in self.polygon_zones:
+                        del self.polygon_zones[video_id]
+                        logger.info(f"Polygon zone cleared for {video_id}")
+
+    def _draw_polygon_overlay(self, canvas: np.ndarray) -> np.ndarray:
+        """在画布上绘制多边形覆盖层（绘制中的轨迹 + 已完成的多边形）"""
+        result = canvas.copy()
+
+        # 绘制正在画的多边形轨迹（画布坐标，无需转换）
+        if self.drawing and len(self.drawing_points) >= 2:
+            pts = np.array(self.drawing_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(result, [pts], isClosed=False, color=(0, 200, 255), thickness=2)
+
+        # 绘制已完成的多边形（视频本地坐标 -> 画布坐标）
+        with self.polygon_lock:
+            for video_id, zone in self.polygon_zones.items():
+                if len(zone.points) < 3:
+                    continue
+                canvas_pts = []
+                for lx, ly in zone.points:
+                    cp = self._video_to_canvas(video_id, lx, ly)
+                    if cp is not None:
+                        canvas_pts.append(cp)
+                if len(canvas_pts) >= 3:
+                    pts_arr = np.array(canvas_pts, dtype=np.int32).reshape((-1, 1, 2))
+                    # 半透明填充
+                    overlay = result.copy()
+                    cv2.fillPoly(overlay, [pts_arr], (0, 255, 0))
+                    cv2.addWeighted(overlay, 0.15, result, 0.85, 0, result)
+                    # 轮廓线
+                    cv2.polylines(result, [pts_arr], isClosed=True,
+                                  color=(0, 255, 0), thickness=2)
+                    # 计数文字
+                    min_x = min(p[0] for p in canvas_pts)
+                    min_y = min(p[1] for p in canvas_pts)
+                    text = f"Count: {zone.count}"
+                    cv2.putText(result, text, (min_x, max(min_y - 10, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        return result
 
 
 class VideoGenerator:
@@ -579,6 +782,13 @@ class PipelineOutputHandler:
             )
         return self.trajectory_managers[video_id]
 
+    def _get_polygon_zone(self, video_id: str) -> Optional[PolygonZone]:
+        """线程安全地获取指定视频的多边形区域"""
+        if self.display is None:
+            return None
+        with self.display.polygon_lock:
+            return self.display.polygon_zones.get(video_id)
+
     def process_frame(self, frame_data: FrameData):
         """处理一帧数据，可视化检测结果"""
         try:
@@ -588,6 +798,12 @@ class PipelineOutputHandler:
                 output_frame = self._draw_detections(
                     output_frame, frame_data.detections, frame_data.video_id
                 )
+
+            # 多边形区域检测计数
+            polygon_zone = self._get_polygon_zone(frame_data.video_id)
+            if polygon_zone is not None:
+                polygon_zone.update(frame_data.detections or [])
+                output_frame = polygon_zone.draw(output_frame)
 
             frame_info_text = f"{frame_data.video_id} Frame: {frame_data.frame_id}"
             cv2.putText(output_frame, frame_info_text, (10, 30),

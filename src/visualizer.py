@@ -13,6 +13,7 @@ from queue import Queue, Empty
 import numpy as np
 
 from pipeline_data import FrameData
+from performance_monitor import PerformanceMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +308,6 @@ class RealtimeDisplay:
         self.stop_event.set()
         if self.display_thread and self.display_thread.is_alive():
             self.display_thread.join(timeout=2.0)
-        cv2.destroyAllWindows()
         self.is_running = False
         logger.info("RealtimeDisplay stopped")
 
@@ -384,7 +384,11 @@ class RealtimeDisplay:
                 self.stop_event.set()
                 break
 
-        cv2.destroyAllWindows()
+        # 只销毁自己的窗口
+        try:
+            cv2.destroyWindow(self.window_name)
+        except cv2.error:
+            pass
 
     def _combine_frames(self, frames: dict) -> Optional[np.ndarray]:
         """
@@ -812,6 +816,9 @@ class PipelineOutputHandler:
             # 实时显示
             if self.display and self.realtime_display:
                 self.display.update_frame(frame_data.video_id, output_frame)
+
+            # 性能探针: 帧处理完成
+            PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "end")
 
             if self.save_frames:
                 self._save_frame(frame_data, output_frame)

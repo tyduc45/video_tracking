@@ -10,6 +10,7 @@ from typing import Callable
 
 from pipeline_data import FrameData
 from video_source import VideoSource
+from performance_monitor import PerformanceMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ class Reader:
                     video_id=self.pipeline_id,
                     video_name=self.video_source.name,
                 )
+
+                # 性能探针: 帧开始处理
+                PerformanceMonitor.probe(self.pipeline_id, frame_id, "start")
 
                 try:
                     self.output_queue.put(frame_data, timeout=5.0)
@@ -176,4 +180,6 @@ class Saver:
             self.stop_event.set()
 
         finally:
+            # 性能探针: 视频处理结束
+            PerformanceMonitor.probe(self.pipeline_id, -1, "finish")
             logger.info(f"[{self.pipeline_id}] Saver stopped")

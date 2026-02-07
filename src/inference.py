@@ -276,24 +276,6 @@ class YOLOInferencer:
         self.model = None
 
 
-class PassthroughTracker:
-    """
-    透传追踪器 - 用于批处理模式
-
-    在批处理模式下，推理已由 BatchProcessor 完成，
-    这个追踪器只是简单透传数据，不执行额外的追踪。
-    """
-
-    def __init__(self, session_id: str = "passthrough"):
-        self.session_id = session_id
-        self.frame_count = 0
-        logger.info(f"PassthroughTracker created: {session_id}")
-
-    def update(self, frame: np.ndarray, detections: List[dict] = None) -> Optional[List[dict]]:
-        """透传更新 - 不执行实际追踪"""
-        self.frame_count += 1
-        return None
-
 
 class ByteTrackTracker:
     """

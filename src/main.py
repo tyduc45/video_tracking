@@ -30,8 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from video_source import LocalVideoSource, WebcamSource
 from config import load_config, save_config, Config
-from inference import YOLOInferencer, PassthroughTracker, ByteTrackTracker
+from inference import YOLOInferencer, ByteTrackTracker
 from visualizer import create_output_handler
+from performance_monitor import PerformanceMonitor
 
 # 设置日志
 logging.basicConfig(
@@ -119,6 +120,8 @@ def main():
                        help='显示窗口宽度（默认1280）')
     parser.add_argument('--display-height', type=int, default=720,
                        help='显示窗口高度（默认720）')
+    parser.add_argument('--perf-monitor', action='store_true',
+                       help='启用性能监控窗口')
 
     args = parser.parse_args()
 
@@ -225,6 +228,13 @@ def run_batch_mode(config, video_sources, args):
         logger.info(f"Realtime display enabled: {display_width}x{display_height}")
         logger.info("Press 'Q' or 'ESC' to stop")
 
+    # 初始化性能监控器
+    perf_monitor_enabled = getattr(args, 'perf_monitor', False)
+    perf_monitor = PerformanceMonitor(num_videos=num_videos, enabled=perf_monitor_enabled)
+    if perf_monitor_enabled:
+        perf_monitor.start()
+        logger.info("Performance monitor enabled")
+
     def save_func(frame_data, output_dir):
         output_handler.process_frame(frame_data)
 
@@ -272,6 +282,9 @@ def run_batch_mode(config, video_sources, args):
         pipeline.wait(timeout=10.0)
     finally:
         output_handler.stop_display()
+        if perf_monitor_enabled:
+            perf_monitor.stop()
+        
 
     # 用户主动退出，直接终止程序
     if user_quit:

@@ -84,41 +84,38 @@ class YOLOInferencer:
             logger.warning(f"Failed to save meta config: {e}")
 
     def _smart_load_model(self, model_path: str):
-        """智能加载模型"""
-        model_ext = os.path.splitext(model_path)[1].lower()
+        """智能加载模型 — 按 batch_size 查找/创建独立的 engine 文件
+
+        命名规范: {model_name}b{batch_size}.engine
+        例如: yolo12nb1.engine, yolo12nb32.engine
+        不同 batch_size 的 engine 文件共存，互不覆盖。
+        """
         base_name = os.path.splitext(os.path.basename(model_path))[0]
 
         pt_path = os.path.join(self.model_dir, f"{base_name}.pt")
-        engine_path = os.path.join(self.model_dir, f"{base_name}.engine")
-
-        engine_batch_size = self.meta.get("engine_batch_size")
-        last_request = self.meta.get("last_request_batch_size")
+        engine_path = os.path.join(
+            self.model_dir, f"{base_name}b{self.requested_batch_size}.engine"
+        )
 
         logger.info(f"Smart model loading:")
         logger.info(f"  Requested batch_size: {self.requested_batch_size}")
-        logger.info(f"  Engine batch_size (meta): {engine_batch_size}")
-        logger.info(f"  Last request batch_size: {last_request}")
+        logger.info(f"  Engine path: {engine_path}")
 
         self.meta["last_request_batch_size"] = self.requested_batch_size
 
         use_engine = False
 
         if os.path.exists(engine_path):
-            if engine_batch_size is not None and engine_batch_size >= self.requested_batch_size:
-                logger.info(f"Engine exists with sufficient batch_size ({engine_batch_size} >= {self.requested_batch_size})")
-                use_engine = True
-            else:
-                logger.info(f"Engine batch_size insufficient, need re-export")
-                if os.path.exists(pt_path):
-                    use_engine = self._export_engine(pt_path, engine_path, self.requested_batch_size)
+            logger.info(f"Engine file found for batch_size={self.requested_batch_size}")
+            use_engine = True
         else:
-            logger.info(f"Engine not found, attempting export")
+            logger.info(f"Engine not found for batch_size={self.requested_batch_size}, attempting export")
             if os.path.exists(pt_path):
                 use_engine = self._export_engine(pt_path, engine_path, self.requested_batch_size)
 
         if use_engine and os.path.exists(engine_path):
             self._load_model(engine_path)
-            self.current_batch_size = self.meta.get("engine_batch_size", self.requested_batch_size)
+            self.current_batch_size = self.requested_batch_size
         elif os.path.exists(pt_path):
             logger.info("Falling back to .pt model (dynamic batch size)")
             self._load_model(pt_path)
@@ -150,7 +147,20 @@ class YOLOInferencer:
                 workspace=4,
             )
 
-            logger.info(f"Engine exported successfully: {export_path}")
+            logger.info(f"Engine exported to: {export_path}")
+
+            # ultralytics 导出的文件名是默认的（如 yolo12n.engine），
+            # 需要重命名为带 batch_size 的目标路径（如 yolo12nb16.engine）
+            export_path = str(export_path)
+            if os.path.exists(export_path) and os.path.normpath(export_path) != os.path.normpath(engine_path):
+                os.rename(export_path, engine_path)
+                logger.info(f"Renamed engine: {export_path} -> {engine_path}")
+
+            if not os.path.exists(engine_path):
+                logger.error(f"Engine file not found at expected path: {engine_path}")
+                return False
+
+            logger.info(f"Engine ready at: {engine_path}")
 
             self.meta["engine_batch_size"] = batch_size
             self.meta["engine_export_time"] = time.strftime("%Y-%m-%d %H:%M:%S")

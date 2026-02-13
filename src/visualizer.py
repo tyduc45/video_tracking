@@ -260,7 +260,7 @@ class RealtimeDisplay:
     """实时显示器 - 在窗口中实时显示处理结果"""
 
     def __init__(self, window_name: str = "Video Object Detection",
-                 display_fps: float = 30.0,
+                 display_fps: float = 60.0,
                  window_width: int = 1280,
                  window_height: int = 720):
         self.window_name = window_name

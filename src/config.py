@@ -61,11 +61,9 @@ class Config:
                 pass
 
         if not self.model_path:
-            engine_path = os.path.join(self.model_dir, f"{self.model_name}.engine")
-            if os.path.exists(engine_path):
-                self.model_path = engine_path
-                return
-
+            # engine 文件按 {model_name}b{batch_size}.engine 命名，
+            # 由 YOLOInferencer._smart_load_model 根据 batch_size 动态查找/创建。
+            # 这里只确定 base model path（.pt 优先）。
             pt_path = os.path.join(self.model_dir, f"{self.model_name}.pt")
             if os.path.exists(pt_path):
                 self.model_path = pt_path

@@ -6,7 +6,10 @@
       "WebSearch",
       "WebFetch(domain:supervision.roboflow.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:blog.roboflow.com)"
+      "WebFetch(domain:blog.roboflow.com)",
+      "Bash(powershell:*)",
+      "Bash(findstr:*)",
+      "Bash(find:*)"
     ]
   }
 }

@@ -122,6 +122,8 @@ def main():
                        help='显示窗口高度（默认720）')
     parser.add_argument('--perf-monitor', action='store_true',
                        help='启用性能监控窗口')
+    parser.add_argument('--strategy', type=int, default=3, choices=[1, 2, 3],
+                       help='处理策略: 1=乱序竞争批处理, 2=独立流水线, 3=当前批处理(默认)')
 
     args = parser.parse_args()
 
@@ -164,8 +166,238 @@ def main():
 
     logger.info(f"Found {len(video_sources)} video source(s)")
 
-    # 7. 运行批处理模式
-    return run_batch_mode(config, video_sources, args)
+    # 7. 根据策略选择运行模式
+    strategy = args.strategy
+    if strategy == 1:
+        return run_chaotic_mode(config, video_sources, args)
+    elif strategy == 2:
+        return run_independent_mode(config, video_sources, args)
+    else:
+        return run_batch_mode(config, video_sources, args)
+
+
+def _create_output_handler_and_monitor(config, args, num_videos):
+    """创建输出处理器和性能监控器（三种策略共用）"""
+    realtime_display = getattr(args, 'display', False)
+    display_width = getattr(args, 'display_width', 1280)
+    display_height = getattr(args, 'display_height', 720)
+
+    output_handler = create_output_handler(
+        config,
+        realtime_display=realtime_display,
+        window_width=display_width,
+        window_height=display_height
+    )
+
+    if realtime_display:
+        logger.info(f"Realtime display enabled: {display_width}x{display_height}")
+        logger.info("Press 'Q' or 'ESC' to stop")
+
+    perf_monitor_enabled = getattr(args, 'perf_monitor', False)
+    perf_monitor = PerformanceMonitor(num_videos=num_videos, enabled=perf_monitor_enabled)
+    if perf_monitor_enabled:
+        perf_monitor.start()
+        logger.info("Performance monitor enabled")
+
+    def save_func(frame_data, output_dir):
+        output_handler.process_frame(frame_data)
+
+    return output_handler, perf_monitor, save_func, realtime_display, perf_monitor_enabled
+
+
+def _wait_for_pipeline(pipeline, output_handler, perf_monitor,
+                       realtime_display, perf_monitor_enabled):
+    """等待流水线完成（三种策略共用）"""
+    user_quit = False
+    try:
+        if realtime_display:
+            import time
+            while not pipeline.stop_event.is_set():
+                if not output_handler.is_display_active():
+                    logger.info("Display window closed, stopping...")
+                    pipeline.stop()
+                    user_quit = output_handler.is_user_quit()
+                    break
+                time.sleep(0.1)
+            pipeline.wait(timeout=10.0)
+        else:
+            pipeline.wait(timeout=None)
+    except KeyboardInterrupt:
+        logger.info("Received interrupt, stopping...")
+        pipeline.stop()
+        user_quit = True
+        pipeline.wait(timeout=10.0)
+    finally:
+        output_handler.stop_display()
+        if perf_monitor_enabled:
+            perf_monitor.stop()
+
+    return user_quit
+
+
+def run_chaotic_mode(config, video_sources, args):
+    """
+    策略1：乱序竞争批处理
+
+    架构：
+    Reader0 ──┐                                              ┌─ VideoProcessor0 (heap+tracker) → Saver0
+    Reader1 ──┼→ shared_queue → ChaoticBatchProcessor → disp ┼─ VideoProcessor1 (heap+tracker) → Saver1
+    Reader2 ──┘   (竞争写入)     (按batch_size打包推理)        └─ VideoProcessor2 (heap+tracker) → Saver2
+    """
+    from chaotic_batch_system import ChaoticBatchPipeline
+
+    num_videos = len(video_sources)
+
+    logger.info("=" * 60)
+    logger.info("Running in CHAOTIC BATCH MODE (Strategy 1)")
+    logger.info(f"  Videos: {num_videos}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info("=" * 60)
+
+    # 1. 加载推理模型
+    try:
+        inferencer = YOLOInferencer(
+            model_path=config.model_path,
+            model_dir=config.model_dir,
+            device=config.device,
+            use_half=config.use_half,
+            confidence_threshold=config.confidence_threshold,
+            iou_threshold=config.iou_threshold,
+            batch_size=args.batch_size
+        )
+        batch_inference_func = inferencer.infer_batch
+    except Exception as e:
+        logger.error(f"Failed to load inference model: {e}")
+        return 1
+
+    def tracker_factory(pipeline_id: str):
+        logger.info(f"Creating ByteTrackTracker for {pipeline_id}")
+        return ByteTrackTracker(session_id=pipeline_id)
+
+    output_handler, perf_monitor, save_func, realtime_display, perf_monitor_enabled = \
+        _create_output_handler_and_monitor(config, args, num_videos)
+
+    # 2. 创建乱序批处理流水线
+    pipeline = ChaoticBatchPipeline(
+        video_sources=video_sources,
+        inference_func=batch_inference_func,
+        tracker_factory=tracker_factory,
+        save_func=save_func,
+        output_dir=config.output_dir,
+        batch_size=args.batch_size,
+        queue_size=200,
+    )
+
+    global _global_stop_event
+    _global_stop_event = pipeline.stop_event
+
+    # 3. 启动处理
+    pipeline.start()
+
+    # 4. 等待完成
+    user_quit = _wait_for_pipeline(
+        pipeline, output_handler, perf_monitor,
+        realtime_display, perf_monitor_enabled
+    )
+
+    if user_quit:
+        logger.info("User quit, exiting program...")
+        sys.exit(0)
+
+    if config.save_video:
+        output_handler.generate_all_videos()
+
+    stats = pipeline.get_stats()
+    logger.info("=" * 60)
+    logger.info("Chaotic Batch Processing Statistics:")
+    logger.info(f"  Total batches: {stats['batch_processor'].get('total_batches', 0)}")
+    logger.info(f"  Total frames: {stats['batch_processor'].get('total_frames', 0)}")
+    logger.info(f"  Inference time: {stats['batch_processor'].get('inference_time', 0):.2f}s")
+    logger.info("=" * 60)
+
+    config_output_path = os.path.join(config.output_dir, "config.json")
+    save_config(config, config_output_path)
+
+    logger.info("Chaotic batch processing completed successfully")
+    return 0
+
+
+def run_independent_mode(config, video_sources, args):
+    """
+    策略2：独立流水线
+
+    每个视频各自维护 Reader → Inferencer → Tracker → Saver 流水线
+    """
+    from independent_pipeline_system import IndependentPipelineManager
+
+    num_videos = len(video_sources)
+
+    logger.info("=" * 60)
+    logger.info("Running in INDEPENDENT MODE (Strategy 2)")
+    logger.info(f"  Videos: {num_videos}")
+    logger.info("=" * 60)
+
+    def inferencer_factory(pipeline_id: str):
+        logger.info(f"Creating YOLOInferencer for {pipeline_id} (batch_size=1)")
+        return YOLOInferencer(
+            model_path=config.model_path,
+            model_dir=config.model_dir,
+            device=config.device,
+            use_half=config.use_half,
+            confidence_threshold=config.confidence_threshold,
+            iou_threshold=config.iou_threshold,
+            batch_size=1
+        )
+
+    def tracker_factory(pipeline_id: str):
+        logger.info(f"Creating ByteTrackTracker for {pipeline_id}")
+        return ByteTrackTracker(session_id=pipeline_id)
+
+    output_handler, perf_monitor, save_func, realtime_display, perf_monitor_enabled = \
+        _create_output_handler_and_monitor(config, args, num_videos)
+
+    # 创建独立流水线管理器
+    pipeline = IndependentPipelineManager(
+        video_sources=video_sources,
+        inferencer_factory=inferencer_factory,
+        tracker_factory=tracker_factory,
+        save_func=save_func,
+        output_dir=config.output_dir,
+        queue_size=200,
+    )
+
+    global _global_stop_event
+    _global_stop_event = pipeline.stop_event
+
+    # 启动
+    pipeline.start()
+
+    # 等待完成
+    user_quit = _wait_for_pipeline(
+        pipeline, output_handler, perf_monitor,
+        realtime_display, perf_monitor_enabled
+    )
+
+    if user_quit:
+        logger.info("User quit, exiting program...")
+        sys.exit(0)
+
+    if config.save_video:
+        output_handler.generate_all_videos()
+
+    stats = pipeline.get_stats()
+    logger.info("=" * 60)
+    logger.info("Independent Pipeline Statistics:")
+    for i, ps in enumerate(stats.get('pipelines', [])):
+        logger.info(f"  Pipeline {i}: reader={ps['reader']['total_frames']} frames, "
+                    f"inference_time={ps['inferencer']['inference_time']:.2f}s")
+    logger.info("=" * 60)
+
+    config_output_path = os.path.join(config.output_dir, "config.json")
+    save_config(config, config_output_path)
+
+    logger.info("Independent pipeline processing completed successfully")
+    return 0
 
 
 def run_batch_mode(config, video_sources, args):
@@ -184,7 +416,7 @@ def run_batch_mode(config, video_sources, args):
     k_values = calculate_k_values(num_videos, args.batch_size)
 
     logger.info("=" * 60)
-    logger.info("Running in BATCH MODE")
+    logger.info("Running in BATCH MODE (Strategy 3)")
     logger.info(f"  Videos: {num_videos}")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  k_values: {k_values}")
@@ -212,31 +444,9 @@ def run_batch_mode(config, video_sources, args):
         logger.info(f"Creating ByteTrackTracker for {pipeline_id}")
         return ByteTrackTracker(session_id=pipeline_id)
 
-    # 3. 创建输出处理器（支持实时显示）
-    realtime_display = getattr(args, 'display', False)
-    display_width = getattr(args, 'display_width', 1280)
-    display_height = getattr(args, 'display_height', 720)
-
-    output_handler = create_output_handler(
-        config,
-        realtime_display=realtime_display,
-        window_width=display_width,
-        window_height=display_height
-    )
-
-    if realtime_display:
-        logger.info(f"Realtime display enabled: {display_width}x{display_height}")
-        logger.info("Press 'Q' or 'ESC' to stop")
-
-    # 初始化性能监控器
-    perf_monitor_enabled = getattr(args, 'perf_monitor', False)
-    perf_monitor = PerformanceMonitor(num_videos=num_videos, enabled=perf_monitor_enabled)
-    if perf_monitor_enabled:
-        perf_monitor.start()
-        logger.info("Performance monitor enabled")
-
-    def save_func(frame_data, output_dir):
-        output_handler.process_frame(frame_data)
+    # 3. 创建输出处理器
+    output_handler, perf_monitor, save_func, realtime_display, perf_monitor_enabled = \
+        _create_output_handler_and_monitor(config, args, num_videos)
 
     # 4. 创建批处理流水线
     logger.info("Creating batch processing pipeline...")
@@ -258,45 +468,21 @@ def run_batch_mode(config, video_sources, args):
     logger.info("Starting batch processing...")
     pipeline.start()
 
-    # 6. 等待完成（支持实时显示退出）
-    logger.info("Waiting for processing to complete...")
-    user_quit = False
-    try:
-        if realtime_display:
-            # 实时显示模式：检查显示窗口是否关闭
-            import time
-            while not pipeline.stop_event.is_set():
-                if not output_handler.is_display_active():
-                    logger.info("Display window closed, stopping...")
-                    pipeline.stop()
-                    user_quit = output_handler.is_user_quit()
-                    break
-                time.sleep(0.1)
-            pipeline.wait(timeout=10.0)
-        else:
-            pipeline.wait(timeout=None)
-    except KeyboardInterrupt:
-        logger.info("Received interrupt, stopping...")
-        pipeline.stop()
-        user_quit = True
-        pipeline.wait(timeout=10.0)
-    finally:
-        output_handler.stop_display()
-        if perf_monitor_enabled:
-            perf_monitor.stop()
-        
+    # 6. 等待完成
+    user_quit = _wait_for_pipeline(
+        pipeline, output_handler, perf_monitor,
+        realtime_display, perf_monitor_enabled
+    )
 
-    # 用户主动退出，直接终止程序
     if user_quit:
         logger.info("User quit, exiting program...")
         sys.exit(0)
 
-    # 7. 生成输出视频
     if config.save_video:
         logger.info("Generating output videos...")
         output_handler.generate_all_videos()
 
-    # 8. 打印统计
+    # 7. 打印统计
     stats = pipeline.get_stats()
     logger.info("=" * 60)
     logger.info("Batch Processing Statistics:")

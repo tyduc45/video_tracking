@@ -9,6 +9,6 @@
   "framework": "yolov8",
   "description": "YOLO v8 Nano model with batch processing support",
   "engine_batch_size": 32,
-  "last_request_batch_size": 64,
+  "last_request_batch_size": 4,
   "engine_export_time": "2026-02-13 15:41:14"
 }

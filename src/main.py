@@ -110,6 +110,8 @@ def main():
                        choices=['cpu', 'cuda'], help='推理设备')
     parser.add_argument('--batch-size', type=int, default=32,
                        help='批处理大小（默认32）')
+    parser.add_argument('--imgsz', type=int, default=640,
+                       help='推理输入分辨率（默认640，可设为1280等）')
     parser.add_argument('--no-frames', action='store_true',
                        help='不保存帧')
     parser.add_argument('--no-video', action='store_true',
@@ -142,6 +144,7 @@ def main():
         config.save_frames = False
     if args.no_video:
         config.save_video = False
+    config.imgsz = args.imgsz
 
     # 3. 验证配置
     check_input_dir = (args.input is None)
@@ -263,7 +266,8 @@ def run_chaotic_mode(config, video_sources, args):
             use_half=config.use_half,
             confidence_threshold=config.confidence_threshold,
             iou_threshold=config.iou_threshold,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            imgsz=config.imgsz,
         )
         batch_inference_func = inferencer.infer_batch
     except Exception as e:
@@ -346,7 +350,8 @@ def run_independent_mode(config, video_sources, args):
             use_half=config.use_half,
             confidence_threshold=config.confidence_threshold,
             iou_threshold=config.iou_threshold,
-            batch_size=1
+            batch_size=1,
+            imgsz=config.imgsz,
         )
 
     def tracker_factory(pipeline_id: str):
@@ -432,7 +437,8 @@ def run_batch_mode(config, video_sources, args):
             use_half=config.use_half,
             confidence_threshold=config.confidence_threshold,
             iou_threshold=config.iou_threshold,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            imgsz=config.imgsz,
         )
         batch_inference_func = inferencer.infer_batch
     except Exception as e:

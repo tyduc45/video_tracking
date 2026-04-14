@@ -20,8 +20,9 @@ class Config:
     # 推理配置
     device: str = "cpu"
     confidence_threshold: float = 0.25
-    iou_threshold: float = 0.65
+    iou_threshold: float = 0.8
     batch_size: int = 32
+    imgsz: int = 640
 
     # Pipeline配置
     queue_size: int = 200
@@ -94,6 +95,7 @@ class Config:
             'confidence_threshold': self.confidence_threshold,
             'iou_threshold': self.iou_threshold,
             'batch_size': self.batch_size,
+            'imgsz': self.imgsz,
             'queue_size': self.queue_size,
             'input_dir': self.input_dir,
             'output_dir': self.output_dir,

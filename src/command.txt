@@ -1,3 +1,1 @@
-python main.py -i ../videos/video0.mp4 ../videos/video01.mp4 ../videos/video00.mp4 ../videos/video1.mp4 --device cuda --batch-size 64 --no-frame --no-video --display --perf-monitor --strategy 3
-
- 
+python main.py -i ../videos/video0.mp4 ../videos/video01.mp4 ../videos/video00.mp4 ../videos/video1.mp4 --device cuda --imgsz 1280 --batch-size 4 --no-frame --no-video --display --perf-monitor --strategy 3

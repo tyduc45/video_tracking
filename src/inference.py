@@ -29,12 +29,13 @@ class YOLOInferencer:
                  device: str = "cuda", use_half: bool = True,
                  confidence_threshold: float = 0.5,
                  iou_threshold: float = 0.45,
-                 batch_size: int = 16):
+                 batch_size: int = 16, imgsz: int = 640):
         self.model_dir = model_dir
         self.device = device
         self.use_half = use_half
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
+        self.imgsz = imgsz
         self.requested_batch_size = batch_size
 
         self.model = None
@@ -54,6 +55,7 @@ class YOLOInferencer:
             "batch_size": 16,
             "use_half": True,
             "input_size": [640, 640],
+            "imgsz": 640,
             "framework": "yolo12",
             "engine_batch_size": None,
             "last_request_batch_size": None,
@@ -84,21 +86,25 @@ class YOLOInferencer:
             logger.warning(f"Failed to save meta config: {e}")
 
     def _smart_load_model(self, model_path: str):
-        """智能加载模型 — 按 batch_size 查找/创建独立的 engine 文件
+        """智能加载模型 — 按 batch_size 和 imgsz 查找/创建独立的 engine 文件
 
-        命名规范: {model_name}b{batch_size}.engine
-        例如: yolo12nb1.engine, yolo12nb32.engine
-        不同 batch_size 的 engine 文件共存，互不覆盖。
+        命名规范:
+          - 640分辨率: {model_name}b{batch_size}.engine
+          - 非640分辨率: {model_name}b{batch_size}_imgsz{imgsz}.engine
+        例如: yolo12nb4.engine, yolo12nb4_imgsz1280.engine
+        不同 batch_size/imgsz 组合的 engine 文件共存，互不覆盖。
         """
         base_name = os.path.splitext(os.path.basename(model_path))[0]
 
         pt_path = os.path.join(self.model_dir, f"{base_name}.pt")
+        imgsz_suffix = f"_imgsz{self.imgsz}" if self.imgsz != 640 else ""
         engine_path = os.path.join(
-            self.model_dir, f"{base_name}b{self.requested_batch_size}.engine"
+            self.model_dir, f"{base_name}b{self.requested_batch_size}{imgsz_suffix}.engine"
         )
 
         logger.info(f"Smart model loading:")
         logger.info(f"  Requested batch_size: {self.requested_batch_size}")
+        logger.info(f"  Image size: {self.imgsz}")
         logger.info(f"  Engine path: {engine_path}")
 
         self.meta["last_request_batch_size"] = self.requested_batch_size
@@ -135,6 +141,7 @@ class YOLOInferencer:
             logger.info(f"  Source: {pt_path}")
             logger.info(f"  Target: {engine_path}")
             logger.info(f"  Batch size: {batch_size}")
+            logger.info(f"  Image size: {self.imgsz}")
 
             model = YOLO(pt_path)
 
@@ -142,6 +149,7 @@ class YOLOInferencer:
                 format='engine',
                 half=self.use_half,
                 batch=batch_size,
+                imgsz=self.imgsz,
                 device=0 if self.device.lower() == "cuda" else "cpu",
                 simplify=True,
                 workspace=4,
@@ -163,6 +171,7 @@ class YOLOInferencer:
             logger.info(f"Engine ready at: {engine_path}")
 
             self.meta["engine_batch_size"] = batch_size
+            self.meta["imgsz"] = self.imgsz
             self.meta["engine_export_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
             return True
@@ -240,6 +249,7 @@ class YOLOInferencer:
                 logger.debug(f"Padded batch: {actual_frame_count} -> {len(frames_to_infer)}")
             else:
                 frames_to_infer = frames
+                
 
             results = self.model.predict(
                 source=frames_to_infer,
@@ -247,6 +257,7 @@ class YOLOInferencer:
                 iou=self.iou_threshold,
                 half=self.use_half,
                 device=device,
+                imgsz=self.imgsz,
                 verbose=False
             )
 

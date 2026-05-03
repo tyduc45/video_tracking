@@ -1,0 +1,20 @@
+# Core runtime
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+numpy>=1.24
+opencv-python>=4.8
+torch==2.10.0
+torchvision==0.25.0
+ultralytics>=8.3
+supervision>=0.25
+
+# TensorRT for CUDA 13.x. TensorRT 10.13.x introduced CUDA 13 support;
+# use the explicit cu13 package so the environment matches nvidia-smi CUDA 13.0.
+tensorrt-cu13>=10.13.3,<10.17
+
+# Performance monitor GUI
+PySide6>=6.6
+pyqtgraph>=0.13
+
+# Tests
+pytest>=8.0

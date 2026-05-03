@@ -275,8 +275,7 @@ class RealtimeDisplay:
         self.display_thread: Optional[threading.Thread] = None
         self.is_running = False
 
-        self.current_frames = {}  # video_id -> (frame_id, latest frame)
-        self.last_displayed_frame_ids: Dict[str, int] = {}
+        self.current_frames = {}  # video_id -> latest frame
         self.lock = threading.Lock()
 
         # 布局追踪: { video_id: { 'x': int, 'y': int, 'w': int, 'h': int, 'scale': float } }
@@ -312,10 +311,10 @@ class RealtimeDisplay:
         self.is_running = False
         logger.info("RealtimeDisplay stopped")
 
-    def update_frame(self, video_id: str, frame: np.ndarray, frame_id: Optional[int] = None):
+    def update_frame(self, video_id: str, frame: np.ndarray):
         """更新某个视频的最新帧"""
         with self.lock:
-            self.current_frames[video_id] = (frame_id, frame.copy())
+            self.current_frames[video_id] = frame.copy()
 
     def _display_loop(self):
         """显示循环"""
@@ -341,15 +340,7 @@ class RealtimeDisplay:
                     continue
 
                 # 拼接所有视频的帧
-                frame_items = {
-                    video_id: frame
-                    for video_id, (_frame_id, frame) in self.current_frames.items()
-                }
-                displayed_frame_ids = {
-                    video_id: frame_id
-                    for video_id, (frame_id, _frame) in self.current_frames.items()
-                }
-                combined = self._combine_frames(frame_items)
+                combined = self._combine_frames(self.current_frames)
 
             if combined is not None:
                 # 首次显示时，根据画布大小调整窗口
@@ -367,13 +358,6 @@ class RealtimeDisplay:
                 combined = self._draw_polygon_overlay(combined)
 
                 cv2.imshow(self.window_name, combined)
-                for video_id, frame_id in displayed_frame_ids.items():
-                    if frame_id is None:
-                        continue
-                    if self.last_displayed_frame_ids.get(video_id) == frame_id:
-                        continue
-                    PerformanceMonitor.probe(video_id, frame_id, "display")
-                    self.last_displayed_frame_ids[video_id] = frame_id
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -831,23 +815,16 @@ class PipelineOutputHandler:
 
             # 实时显示
             if self.display and self.realtime_display:
-                self.display.update_frame(
-                    frame_data.video_id, output_frame, frame_data.frame_id
-                )
+                self.display.update_frame(frame_data.video_id, output_frame)
 
-            # 性能探针: 推理、追踪和可视化绘制完成
-            PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "process_end")
+            # 性能探针: 帧处理完成
+            PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "end")
 
             if self.save_frames:
                 self._save_frame(frame_data, output_frame)
 
             if self.save_video:
                 self._record_frame_info(frame_data, output_frame)
-
-            # 无实时显示时，以保存/记录完成作为端到端完成点。
-            # 实时显示开启时，e2e_latency 由显示线程在真实 imshow 后记录。
-            if not (self.display and self.realtime_display):
-                PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "save")
 
         except Exception as e:
             logger.error(f"Error processing frame: {e}")

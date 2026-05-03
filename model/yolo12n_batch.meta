@@ -1,15 +1,62 @@
 {
   "model_name": "yolo12n",
-  "batch_size": 32,
+  "framework": "yolo12",
+  "ultralytics_version": "8.4.46",
+  "tensorrt_version": "10.16.1.11",
+  "torch_version": "2.10.0+cu130",
+  "cuda_version": "13.0",
   "use_half": true,
+  "engine_export_time": "2026-05-03 16:22:54",
+  "engines": [
+    {
+      "target": "yolo12nb1.engine",
+      "batch": 1,
+      "imgsz": 640,
+      "ok": true,
+      "seconds": 235.51479530334473
+    },
+    {
+      "target": "yolo12nb4.engine",
+      "batch": 4,
+      "imgsz": 640,
+      "ok": true,
+      "seconds": 192.72594141960144
+    },
+    {
+      "target": "yolo12nb16.engine",
+      "batch": 16,
+      "imgsz": 640,
+      "ok": true,
+      "seconds": 215.98249650001526
+    },
+    {
+      "target": "yolo12nb32.engine",
+      "batch": 32,
+      "imgsz": 640,
+      "ok": true,
+      "seconds": 295.27136993408203
+    },
+    {
+      "target": "yolo12nb64.engine",
+      "batch": 64,
+      "imgsz": 640,
+      "ok": true,
+      "seconds": 393.1535017490387
+    },
+    {
+      "target": "yolo12nb4_imgsz1280.engine",
+      "batch": 4,
+      "imgsz": 1280,
+      "ok": true,
+      "seconds": 218.6505148410797
+    }
+  ],
+  "batch_size": 16,
   "input_size": [
     640,
     640
   ],
-  "framework": "yolov8",
-  "description": "YOLO v8 Nano model with batch processing support",
-  "engine_batch_size": 4,
-  "last_request_batch_size": 4,
-  "engine_export_time": "2026-04-14 15:46:21",
-  "imgsz": 1280
+  "imgsz": 640,
+  "engine_batch_size": null,
+  "last_request_batch_size": 4
 }

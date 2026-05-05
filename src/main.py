@@ -41,6 +41,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+STRATEGY_NAMES = {
+    1: "heap-reord",
+    2: "para",
+    3: "batch-distrib",
+}
+
+STRATEGY_ALIASES = {
+    **{str(key): key for key in STRATEGY_NAMES},
+    **{name: key for key, name in STRATEGY_NAMES.items()},
+}
+
+
+def normalize_strategy(value: str) -> int:
+    """Normalize numeric or textual strategy names to internal strategy ids."""
+    key = str(value).strip().lower()
+    if key in STRATEGY_ALIASES:
+        return STRATEGY_ALIASES[key]
+
+    valid = ", ".join(
+        f"{strategy_id}/{name}" for strategy_id, name in STRATEGY_NAMES.items()
+    )
+    raise argparse.ArgumentTypeError(f"unknown strategy '{value}', expected one of: {valid}")
+
 
 def setup_logging(config: Config):
     """配置日志系统"""
@@ -124,8 +147,8 @@ def main():
                        help='显示窗口高度（默认720）')
     parser.add_argument('--perf-monitor', action='store_true',
                        help='启用性能监控窗口')
-    parser.add_argument('--strategy', type=int, default=3, choices=[1, 2, 3],
-                       help='处理策略: 1=乱序竞争批处理, 2=独立流水线, 3=当前批处理(默认)')
+    parser.add_argument('--strategy', type=normalize_strategy, default=3,
+                       help='处理策略: 1/heap-reord=乱序竞争批处理, 2/para=独立流水线, 3/batch-distrib=当前批处理(默认)')
 
     args = parser.parse_args()
 
@@ -171,6 +194,7 @@ def main():
 
     # 7. 根据策略选择运行模式
     strategy = args.strategy
+    logger.info(f"Selected strategy: {strategy}/{STRATEGY_NAMES[strategy]}")
     if strategy == 1:
         return run_chaotic_mode(config, video_sources, args)
     elif strategy == 2:
@@ -253,6 +277,7 @@ def run_chaotic_mode(config, video_sources, args):
 
     logger.info("=" * 60)
     logger.info("Running in CHAOTIC BATCH MODE (Strategy 1)")
+    logger.info(f"  Strategy name: {STRATEGY_NAMES[1]}")
     logger.info(f"  Videos: {num_videos}")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info("=" * 60)
@@ -338,6 +363,7 @@ def run_independent_mode(config, video_sources, args):
 
     logger.info("=" * 60)
     logger.info("Running in INDEPENDENT MODE (Strategy 2)")
+    logger.info(f"  Strategy name: {STRATEGY_NAMES[2]}")
     logger.info(f"  Videos: {num_videos}")
     logger.info("=" * 60)
 
@@ -422,6 +448,7 @@ def run_batch_mode(config, video_sources, args):
 
     logger.info("=" * 60)
     logger.info("Running in BATCH MODE (Strategy 3)")
+    logger.info(f"  Strategy name: {STRATEGY_NAMES[3]}")
     logger.info(f"  Videos: {num_videos}")
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  k_values: {k_values}")

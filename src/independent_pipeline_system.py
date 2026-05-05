@@ -49,6 +49,8 @@ class IndependentInferencer:
                     self.output_queue.put(None, timeout=1.0)
                     break
 
+                PerformanceMonitor.probe(self.pipeline_id, frame_data.frame_id, "start")
+
                 start_time = time.time()
                 try:
                     detections = self.inferencer.infer(frame_data.frame)

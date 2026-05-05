@@ -59,9 +59,6 @@ class Reader:
                     video_name=self.video_source.name,
                 )
 
-                # 性能探针: 帧开始处理
-                PerformanceMonitor.probe(self.pipeline_id, frame_id, "start")
-
                 try:
                     self.output_queue.put(frame_data, timeout=5.0)
                     self.stats['total_frames'] += 1

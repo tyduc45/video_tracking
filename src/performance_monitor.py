@@ -6,12 +6,15 @@
 
 import threading
 import time
+import csv
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 import logging
+from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,7 @@ class VideoTimer:
     video_id: str
     frame_id: int = 0                    # 当前帧ID
     start_time: float = 0.0              # 开始时间戳(高精度)
+    start_times: Dict[int, float] = field(default_factory=dict)
     latencies: List[float] = field(default_factory=list)  # 历史延迟记录
     is_active: bool = True               # 是否活跃
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -265,17 +269,35 @@ class PerformanceMonitor:
                 cls._instance._initialized = False
             return cls._instance
 
-    def __init__(self, num_videos: int = 1, enabled: bool = True):
+    def __init__(self, num_videos: int = 1, enabled: bool = True,
+                 record_latency: bool = False,
+                 record_dir: Optional[str] = None,
+                 config_title: Optional[str] = None,
+                 max_records: int = 120):
         if self._initialized:
             return
 
         self.enabled = enabled
         self.timers: Dict[str, VideoTimer] = {}
         self.timers_lock = threading.Lock()
+        self.config_title = config_title or "unknown"
+        self.record_latency = record_latency
+        self.record_dir = Path(record_dir) if record_dir else None
+        self.max_records = max_records
+        self.record_count = 0
+        self.record_lock = threading.Lock()
+        self.record_file = None
+        self.record_writer = None
+        self.record_path: Optional[Path] = None
+        self.pipeline_stop_event: Optional[threading.Event] = None
 
         self.window: Optional[PerformanceWindow] = None
         if enabled:
-            self.window = PerformanceWindow(num_videos=num_videos)
+            window_name = f"Performance Monitor - {self.config_title}"
+            self.window = PerformanceWindow(window_name=window_name, num_videos=num_videos)
+
+        if self.record_latency:
+            self._open_record_file()
 
         self._initialized = True
         logger.info(f"PerformanceMonitor initialized, enabled={enabled}")
@@ -303,6 +325,39 @@ class PerformanceMonitor:
         """停止性能监控"""
         if self.window:
             self.window.stop()
+        self._close_record_file()
+
+    def set_stop_event(self, stop_event: threading.Event):
+        """设置达到记录上限时要触发的流水线停止事件"""
+        self.pipeline_stop_event = stop_event
+
+    def _open_record_file(self):
+        """打开当前运行的延迟记录CSV"""
+        if not self.record_dir:
+            return
+
+        self.record_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_"
+            for ch in self.config_title
+        ).strip("_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_path = self.record_dir / f"latency_{safe_title}_{timestamp}.csv"
+        self.record_file = self.record_path.open("w", newline="", encoding="utf-8")
+        self.record_writer = csv.writer(self.record_file)
+        self.record_writer.writerow(["idx", "latency_ms"])
+        self.record_file.flush()
+        logger.info(f"Latency recording enabled: {self.record_path}")
+
+    def _close_record_file(self):
+        """关闭延迟记录CSV"""
+        with self.record_lock:
+            if self.record_file:
+                self.record_file.flush()
+                self.record_file.close()
+                logger.info(f"Latency recording saved: {self.record_path}")
+            self.record_file = None
+            self.record_writer = None
 
     def _get_or_create_timer(self, video_id: str) -> VideoTimer:
         """获取或创建视频计时器"""
@@ -327,7 +382,7 @@ class PerformanceMonitor:
                 - finish: 视频结束，计算最终统计
         """
         instance = PerformanceMonitor.get_instance()
-        if instance is None or not instance.enabled:
+        if instance is None or (not instance.enabled and not instance.record_latency):
             return
 
         if action == "start":
@@ -344,6 +399,7 @@ class PerformanceMonitor:
         with timer.lock:
             timer.frame_id = frame_id
             timer.start_time = time.perf_counter()
+            timer.start_times[frame_id] = timer.start_time
 
             if timer.total_frames == 0:
                 timer.first_frame_time = timer.start_time
@@ -355,11 +411,15 @@ class PerformanceMonitor:
         timer = self._get_or_create_timer(video_id)
 
         with timer.lock:
-            if timer.start_time == 0:
+            start_time = timer.start_times.pop(frame_id, None)
+            if start_time is None:
+                start_time = timer.start_time
+
+            if start_time == 0:
                 return  # 没有对应的start
 
             # 计算延迟
-            latency = end_time - timer.start_time
+            latency = end_time - start_time
 
             # 更新统计
             timer.latencies.append(latency)
@@ -373,6 +433,29 @@ class PerformanceMonitor:
 
             # 重置start_time
             timer.start_time = 0
+
+        self._record_latency(frame_id, latency)
+
+    def _record_latency(self, frame_id: int, latency: float):
+        """记录单帧处理延迟，并在达到上限时请求停止流水线"""
+        if not self.record_latency or not self.record_writer:
+            return
+
+        latency_ms = latency * 1000
+        should_stop = False
+        with self.record_lock:
+            if self.record_count >= self.max_records:
+                return
+
+            self.record_count += 1
+            self.record_writer.writerow([self.record_count, f"{latency_ms:.6f}"])
+            self.record_file.flush()
+            should_stop = self.record_count >= self.max_records
+
+        if should_stop:
+            logger.info(f"Latency record limit reached: {self.record_count} frames")
+            if self.pipeline_stop_event:
+                self.pipeline_stop_event.set()
 
     def _handle_finish(self, video_id: str):
         """处理视频结束事件"""

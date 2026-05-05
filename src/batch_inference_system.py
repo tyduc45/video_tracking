@@ -19,6 +19,8 @@ from queue import Queue, Empty
 from typing import List, Optional, Callable, Dict, Any, Tuple
 from dataclasses import dataclass
 
+from performance_monitor import PerformanceMonitor
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,6 +216,13 @@ class MultiVideoBatchProcessor:
                 if not batch_frames:
                     time.sleep(0.01)
                     continue
+
+                for meta in frame_metas:
+                    PerformanceMonitor.probe(
+                        meta.frame_data.video_id,
+                        meta.frame_data.frame_id,
+                        "start"
+                    )
 
                 start_time = time.time()
                 try:

@@ -63,8 +63,6 @@ class ChaoticReader:
                     video_id=self.pipeline_id,
                     video_name=self.video_source.name,
                 )
-                PerformanceMonitor.probe(self.pipeline_id, frame_id, "start")
-
                 try:
                     self.shared_queue.put(frame_data, timeout=5.0)
                     self.stats['total_frames'] += 1
@@ -131,6 +129,9 @@ class ChaoticBatchProcessor:
                     if finished_readers >= self.num_videos:
                         break
                     continue
+
+                for frame_data in batch_metas:
+                    PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "start")
 
                 # 批推理
                 start_time = time.time()

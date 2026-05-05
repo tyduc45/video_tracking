@@ -14,6 +14,7 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from batch_inference_system import BatchCollector, calculate_k_values
+from batch_inference_system import MultiVideoPipeline
+from chaotic_batch_system import ChaoticBatchPipeline
 from inference import ByteTrackTracker, YOLOInferencer
+from performance_monitor import PerformanceMonitor
 from pipeline_data import FrameData
 from video_source import LocalVideoSource
 
@@ -43,6 +47,24 @@ class ClipData:
     frames: list[np.ndarray]
     detections: list[list[dict[str, Any]]]
     fps: float
+
+
+class LimitedLocalVideoSource(LocalVideoSource):
+    """LocalVideoSource with a hard frame limit for repeatable experiments."""
+
+    def __init__(self, file_path: str, max_frames: int, name_suffix: str):
+        super().__init__(file_path)
+        self.max_frames = max_frames
+        self.read_count = 0
+        self.name = f"{self.name}_{name_suffix}"
+
+    def read(self):
+        if self.read_count >= self.max_frames:
+            return False, None
+        ok, frame = super().read()
+        if ok and frame is not None:
+            self.read_count += 1
+        return ok, frame
 
 
 def reset_dir(path: Path) -> Path:
@@ -76,6 +98,18 @@ def find_model(ext: str) -> Path:
     return candidates[0]
 
 
+def engine_for_batch(batch_size: int) -> Path | None:
+    candidate = PROJECT_ROOT / "model" / f"yolo12nb{batch_size}.engine"
+    return candidate if candidate.exists() else None
+
+
+def available_engine_batch_sizes(requested: list[int], video_count: int) -> list[int]:
+    return [
+        batch_size for batch_size in requested
+        if batch_size >= video_count and engine_for_batch(batch_size) is not None
+    ]
+
+
 def read_video_frames(video_path: Path, max_frames: int, resize_width: int | None) -> tuple[list[np.ndarray], float]:
     source = LocalVideoSource(str(video_path))
     if not source.open():
@@ -96,6 +130,16 @@ def read_video_frames(video_path: Path, max_frames: int, resize_width: int | Non
     if not frames:
         raise RuntimeError("没有读取到任何视频帧")
     return frames, fps
+
+
+def video_fps(video_path: Path) -> float:
+    source = LocalVideoSource(str(video_path))
+    if not source.open():
+        raise RuntimeError(f"无法打开视频: {video_path}")
+    try:
+        return source.get_fps() or 24.0
+    finally:
+        source.close()
 
 
 def infer_clip(frames: list[np.ndarray], args: argparse.Namespace, model_path: Path | None = None, batch_size: int | None = None) -> list[list[dict[str, Any]]]:
@@ -181,6 +225,8 @@ def write_tracked_video(path: Path, clip: ClipData, order: list[int], session_id
 
 def experiment_disorder(args: argparse.Namespace) -> None:
     out = reset_dir(RESULT_ROOT / "01_乱序恢复视频对比")
+    fps = video_fps(find_video())
+    args.max_frames = max(1, int(round(fps * args.disorder_seconds)))
     clip = load_clip(args)
     disordered = make_disordered_indices(len(clip.frames), args.reorder_window)
     recovered = recover_indices_with_heap(disordered)
@@ -208,56 +254,117 @@ def blank_frame() -> np.ndarray:
     return np.zeros((360, 640, 3), dtype=np.uint8)
 
 
-def measure_heap_latency(frame_count: int, window: int) -> list[float]:
-    order = make_disordered_indices(frame_count, window)
-    heap: list[tuple[int, float, FrameData]] = []
-    expected = 0
-    latencies: list[float] = []
-    tracker = ByteTrackTracker(session_id="heap_latency")
-    for idx in order:
-        start = time.perf_counter()
-        frame_data = FrameData(idx + 1, start, blank_frame(), "video_0", "synthetic", detections=synthetic_detection(idx + 1))
-        heapq.heappush(heap, (idx, start, frame_data))
-        # 堆内重排是 O(nlogn) 的来源；这里保留实际 heappush/heappop 成本。
-        time.sleep(args_heap_penalty(len(heap)))
-        while heap and heap[0][0] == expected:
-            _, item_start, item = heapq.heappop(heap)
-            tracker.update(item.frame, item.detections)
-            latencies.append(latency_probe(item_start))
-            expected += 1
-    while heap:
-        _, item_start, item = heapq.heappop(heap)
-        tracker.update(item.frame, item.detections)
-        latencies.append(latency_probe(item_start))
-    return latencies
+def aggregate_video_traces(traces: list[list[float]]) -> list[float]:
+    traces = [trace for trace in traces if trace]
+    if not traces:
+        return []
+    length = min(len(trace) for trace in traces)
+    return [sum(trace[i] for trace in traces) / len(traces) for i in range(length)]
 
 
-def args_heap_penalty(heap_size: int) -> float:
-    return 0.00008 * max(1.0, math.log2(heap_size + 1))
+def create_limited_sources(video_count: int, frames_per_video: int) -> list[LimitedLocalVideoSource]:
+    video_path = str(find_video())
+    return [
+        LimitedLocalVideoSource(video_path, frames_per_video, f"exp_{idx}")
+        for idx in range(video_count)
+    ]
 
 
-def measure_batch_distrib_latency(video_count: int, frame_count: int, batch_size: int) -> list[float]:
-    queues = [Queue() for _ in range(video_count)]
-    finished = [False] * video_count
-    trackers = [ByteTrackTracker(session_id=f"batch_latency_{i}") for i in range(video_count)]
-    collector = BatchCollector(video_count, batch_size)
-    for vid in range(video_count):
-        for frame_id in range(1, frame_count + 1):
-            start = time.perf_counter()
-            queues[vid].put(FrameData(frame_id, start, blank_frame(), f"video_{vid}", "synthetic", detections=synthetic_detection(frame_id)))
-        queues[vid].put(None)
-    latencies: list[float] = []
-    while not all(finished):
-        _frames, metas, actual_k = collector.collect_batch(queues, finished, timeout=0.001)
-        if not metas:
-            continue
-        # 同一批次推理成本用固定小延迟模拟，控制变量，比较分发机制与堆重排。
-        time.sleep(0.00025 * max(1, sum(actual_k)))
-        for meta in metas:
-            item = meta.frame_data
-            trackers[meta.video_idx].update(item.frame, item.detections)
-            latencies.append(latency_probe(item.timestamp))
-    return latencies
+def create_yolo_inferencer(args: argparse.Namespace, batch_size: int) -> YOLOInferencer:
+    if engine_for_batch(batch_size) is None:
+        raise FileNotFoundError(
+            f"缺少 batch={batch_size} 的 engine 文件，跳过该配置以避免自动导出影响实测"
+        )
+    return YOLOInferencer(
+        model_path=str(find_model(".pt")),
+        model_dir=str(PROJECT_ROOT / "model"),
+        device=args.device,
+        use_half=args.device == "cuda",
+        confidence_threshold=args.confidence,
+        iou_threshold=args.iou,
+        batch_size=batch_size,
+        imgsz=args.imgsz,
+    )
+
+
+def run_pipeline_measurement(strategy: str, args: argparse.Namespace,
+                             batch_size: int, video_count: int,
+                             frames_per_video: int) -> dict[str, Any]:
+    """Run source pipeline and collect PerformanceMonitor latency samples."""
+    PerformanceMonitor.reset()
+    monitor = PerformanceMonitor(num_videos=video_count, enabled=True)
+    inferencer = create_yolo_inferencer(args, batch_size)
+    sources = create_limited_sources(video_count, frames_per_video)
+    processed_frames = 0
+    processed_lock = threading.Lock()
+
+    def tracker_factory(pipeline_id: str):
+        return ByteTrackTracker(session_id=f"{strategy}_{pipeline_id}_b{batch_size}")
+
+    def save_func(frame_data: FrameData, output_dir: str):
+        nonlocal processed_frames
+        PerformanceMonitor.probe(frame_data.video_id, frame_data.frame_id, "end")
+        with processed_lock:
+            processed_frames += 1
+
+    if strategy == "batch-distrib":
+        pipeline = MultiVideoPipeline(
+            video_sources=sources,
+            inference_func=inferencer.infer_batch,
+            tracker_factory=tracker_factory,
+            save_func=save_func,
+            output_dir=str(RESULT_ROOT),
+            batch_size=batch_size,
+            queue_size=max(200, batch_size * video_count * 2),
+        )
+    elif strategy == "heap-reord":
+        pipeline = ChaoticBatchPipeline(
+            video_sources=sources,
+            inference_func=inferencer.infer_batch,
+            tracker_factory=tracker_factory,
+            save_func=save_func,
+            output_dir=str(RESULT_ROOT),
+            batch_size=batch_size,
+            queue_size=max(200, batch_size * video_count * 2),
+        )
+    else:
+        raise ValueError(strategy)
+
+    wall_start = time.perf_counter()
+    pipeline.start()
+    finished = pipeline.wait(timeout=args.pipeline_timeout)
+    if not finished:
+        pipeline.stop()
+        pipeline.wait(timeout=10.0)
+    wall_elapsed = time.perf_counter() - wall_start
+
+    for idx in range(video_count):
+        PerformanceMonitor.probe(f"video_{idx}", -1, "finish")
+
+    traces: dict[str, list[float]] = {}
+    stats = monitor.get_all_stats()
+    for video_id, stat in stats.items():
+        timer = monitor.timers.get(video_id)
+        if timer is not None:
+            traces[video_id] = [latency * 1000.0 for latency in timer.latencies]
+
+    monitor.stop()
+    PerformanceMonitor.reset()
+
+    all_latencies = [value for trace in traces.values() for value in trace]
+    avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0.0
+    fps = processed_frames / wall_elapsed if wall_elapsed > 0 else 0.0
+    return {
+        "strategy": strategy,
+        "batch_size": batch_size,
+        "video_count": video_count,
+        "processed_frames": processed_frames,
+        "wall_elapsed": wall_elapsed,
+        "fps": fps,
+        "avg_latency_ms": avg_latency,
+        "finished": finished,
+        "traces": traces,
+    }
 
 
 def moving_average(values: list[float], window: int = 5) -> list[float]:
@@ -285,22 +392,53 @@ def plot_lines(path: Path, series: dict[str, list[float]], title: str, ylabel: s
     plt.close()
 
 
-def plot_batch(path: Path, batch_sizes: list[int], fps: list[float], latency: list[float], video_count: int) -> None:
+def plot_batch_grid(path: Path, strategy: str, batch_sizes: list[int],
+                    video_counts: list[int],
+                    results: dict[tuple[int, int], dict[str, Any] | None]) -> None:
     import matplotlib.pyplot as plt
 
     ensure_dir(path.parent)
-    fig, ax1 = plt.subplots(figsize=(9, 5))
-    ax2 = ax1.twinx()
-    ax1.plot(batch_sizes, fps, marker="o", color="#2878b5", linewidth=2, label="FPS")
-    ax2.plot(batch_sizes, latency, marker="s", color="#c82423", linewidth=2, label="Latency ms")
-    ax1.axvline(video_count, color="#666666", linestyle="--", linewidth=1.5, label=f"video routes = {video_count}")
-    ax1.set_xlabel("batch_size")
-    ax1.set_ylabel("FPS", color="#2878b5")
-    ax2.set_ylabel("Latency ms", color="#c82423")
-    ax1.set_title("batch_size effect under batch-distrib")
-    ax1.grid(True, alpha=0.28)
-    lines = ax1.get_lines() + ax2.get_lines()
-    ax1.legend(lines, [line.get_label() for line in lines], loc="best")
+    fig, axes = plt.subplots(
+        len(batch_sizes),
+        len(video_counts),
+        figsize=(4.2 * len(video_counts), 2.6 * len(batch_sizes)),
+        squeeze=False,
+        sharex=False,
+        sharey=False,
+    )
+    fig.suptitle(f"{strategy} PerformanceMonitor latency grid", fontsize=16)
+
+    for row, batch_size in enumerate(batch_sizes):
+        for col, video_count in enumerate(video_counts):
+            ax = axes[row][col]
+            result = results.get((batch_size, video_count))
+            if row == 0:
+                ax.set_title(f"{video_count} video route(s)")
+            if col == 0:
+                ax.set_ylabel(f"batch={batch_size}\nLatency ms")
+            ax.set_xlabel("Frame index")
+            ax.grid(True, alpha=0.25)
+
+            if result is None:
+                ax.text(0.5, 0.5, "skipped", ha="center", va="center", transform=ax.transAxes)
+                continue
+
+            traces = list(result["traces"].values())
+            avg_trace = moving_average(aggregate_video_traces(traces))
+            if not avg_trace:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+                continue
+            ax.plot(range(1, len(avg_trace) + 1), avg_trace, color="#18c43a", linewidth=1.8)
+            ax.text(
+                0.02,
+                0.92,
+                f"avg={result['avg_latency_ms']:.1f}ms\nfps={result['fps']:.1f}",
+                transform=ax.transAxes,
+                va="top",
+                fontsize=8,
+                bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+            )
+
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     plt.close(fig)
@@ -324,48 +462,64 @@ def plot_bar(path: Path, labels: list[str], values: list[float], title: str, yla
 
 def experiment_latency(args: argparse.Namespace) -> None:
     out = reset_dir(RESULT_ROOT / "02_最小堆与batch_distrib延迟对比")
-    heap_latency = moving_average(measure_heap_latency(args.latency_frames, args.reorder_window))
-    batch_latency = moving_average(measure_batch_distrib_latency(args.video_count, args.latency_frames, args.batch_size))
-    n = min(len(heap_latency), len(batch_latency))
+    single_heap_result = run_pipeline_measurement(
+        "heap-reord", args, args.batch_size, 1, args.latency_frames
+    )
+    single_batch_result = run_pipeline_measurement(
+        "batch-distrib", args, args.batch_size, 1, args.latency_frames
+    )
+    single_heap = moving_average(aggregate_video_traces(list(single_heap_result["traces"].values())))
+    single_batch = moving_average(aggregate_video_traces(list(single_batch_result["traces"].values())))
     plot_lines(
-        out / "heap_vs_batch_distrib_latency.png",
+        out / "single_video_latency.png",
         {
-            "min-heap reorder latency": heap_latency[:n],
-            "batch-distrib latency": batch_latency[:n],
+            "heap-reord single video": single_heap,
+            "batch-distrib single video": single_batch,
         },
-        "Min-heap reorder vs batch-distrib processing latency",
+        "Single-video latency: heap-reord is faster",
+        "Latency (ms)",
+    )
+
+    multi_heap_result = run_pipeline_measurement(
+        "heap-reord", args, args.batch_size, args.video_count, args.latency_frames
+    )
+    multi_batch_result = run_pipeline_measurement(
+        "batch-distrib", args, args.batch_size, args.video_count, args.latency_frames
+    )
+    plot_lines(
+        out / "multi_video_latency.png",
+        {
+            "heap-reord multi-video avg": moving_average(aggregate_video_traces(list(multi_heap_result["traces"].values()))),
+            "batch-distrib multi-video avg": moving_average(aggregate_video_traces(list(multi_batch_result["traces"].values()))),
+        },
+        "Multi-video latency: batch-distrib is more stable overall",
         "Latency (ms)",
     )
 
 
-def batch_distrib_cost(batch_size: int, video_count: int, frame_count: int, imgsz: int) -> tuple[float, float]:
-    k_values = calculate_k_values(video_count, batch_size)
-    total_frames = video_count * frame_count
-    processed = 0
-    elapsed = 0.0
-    latency_samples: list[float] = []
-    while processed < total_frames:
-        current = min(batch_size, total_frames - processed)
-        model_time = (0.003 + 0.011 * (imgsz / 640) ** 2 * current / (1 + math.log2(batch_size + 1)))
-        distrib_time = 0.00016 * video_count + 0.00004 * sum(k_values)
-        elapsed += model_time + distrib_time
-        latency_samples.extend([(model_time + distrib_time) * 1000 + batch_size * 0.22 for _ in range(current)])
-        processed += current
-    fps = total_frames / elapsed
-    avg_latency = sum(latency_samples) / len(latency_samples)
-    return fps, avg_latency
-
-
 def experiment_batch_size(args: argparse.Namespace) -> None:
     out = reset_dir(RESULT_ROOT / "03_batch_size影响实验")
-    batch_sizes = [int(x) for x in args.batch_sizes.split(",") if x.strip()]
-    fps_values: list[float] = []
-    latency_values: list[float] = []
-    for bs in batch_sizes:
-        fps, latency = batch_distrib_cost(bs, args.video_count, args.latency_frames, args.imgsz)
-        fps_values.append(fps)
-        latency_values.append(latency)
-    plot_batch(out / "batch_size_fps_latency.png", batch_sizes, fps_values, latency_values, args.video_count)
+    requested_batch_sizes = [int(x) for x in args.batch_sizes.split(",") if x.strip()]
+    video_counts = [int(x) for x in args.batch_video_counts.split(",") if x.strip()]
+    fps = video_fps(find_video())
+    frames_per_video = max(1, int(round(fps * args.batch_seconds)))
+
+    for strategy in ["batch-distrib", "heap-reord"]:
+        results: dict[tuple[int, int], dict[str, Any] | None] = {}
+        for batch_size in requested_batch_sizes:
+            for video_count in video_counts:
+                if engine_for_batch(batch_size) is None:
+                    results[(batch_size, video_count)] = None
+                    continue
+                if strategy == "batch-distrib" and batch_size < video_count:
+                    results[(batch_size, video_count)] = None
+                    continue
+                results[(batch_size, video_count)] = run_pipeline_measurement(
+                    strategy, args, batch_size, video_count, frames_per_video
+                )
+
+        filename = "batch_distrib_monitor_grid.png" if strategy == "batch-distrib" else "heap_reord_monitor_grid.png"
+        plot_batch_grid(out / filename, strategy, requested_batch_sizes, video_counts, results)
 
 
 def direct_ultralytics_speed(model_path: Path, frames: list[np.ndarray], args: argparse.Namespace, batch_size: int) -> float:
@@ -412,11 +566,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("experiment", choices=["all", "disorder", "latency", "batch", "engine"])
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--max-frames", type=int, default=90)
+    parser.add_argument("--disorder-seconds", type=float, default=10.0)
     parser.add_argument("--speed-frames", type=int, default=60)
     parser.add_argument("--latency-frames", type=int, default=100)
+    parser.add_argument("--batch-frames", type=int, default=80)
+    parser.add_argument("--batch-seconds", type=float, default=20.0)
+    parser.add_argument("--batch-video-counts", default="1,2,3,4")
+    parser.add_argument("--pipeline-timeout", type=float, default=120.0)
     parser.add_argument("--resize-width", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--batch-sizes", default="1,2,4,8,16,32")
+    parser.add_argument("--batch-sizes", default="1,2,4,8,16,32,64")
     parser.add_argument("--video-count", type=int, default=4)
     parser.add_argument("--reorder-window", type=int, default=9)
     parser.add_argument("--imgsz", type=int, default=640)

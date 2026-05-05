@@ -58,5 +58,5 @@
   ],
   "imgsz": 640,
   "engine_batch_size": null,
-  "last_request_batch_size": 4
+  "last_request_batch_size": 16
 }

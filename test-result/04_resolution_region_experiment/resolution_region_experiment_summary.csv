@@ -1,0 +1,3 @@
+﻿"Name","Status","Seconds","Rows","Csv","Video"
+"resolution_1280","OK","12.6","240","E:\cpp_review\video_object_search\test-result\04_resolution_region_experiment\resolution_1280_region_counts.csv","E:\cpp_review\video_object_search\test-result\04_resolution_region_experiment\resolution_1280_tracked.mp4"
+"resolution_640","OK","11.3","240","E:\cpp_review\video_object_search\test-result\04_resolution_region_experiment\resolution_640_region_counts.csv","E:\cpp_review\video_object_search\test-result\04_resolution_region_experiment\resolution_640_tracked.mp4"

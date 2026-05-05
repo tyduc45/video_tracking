@@ -1,0 +1,11 @@
+python test\run_experiments.py all --device cuda --batch-size 4 # 乱序回复+文件格式对比
+
+powershell -ExecutionPolicy Bypass -File scripts\run_batch_size_latency_experiment.ps1  #batch size 延迟实验，循环跑完后自动画图
+
+powershell -ExecutionPolicy Bypass -File scripts\measure_strategy_memory.ps1 -BatchSize 4 -DurationSeconds 15 -WarmupSeconds 3 -SampleIntervalMs 500 # 显存实验常用参数版
+
+powershell -ExecutionPolicy Bypass -File scripts\run_resolution_region_experiment.ps1 -TimeoutSec 300  #分辨率区域计数实验
+
+python test\plot_latency_grid.py --input-dir test-result\03_batch_size影响实验 --output-dir test-result\02_batch_size延迟对比 --output-dir test-result\03_batch_size影响实验   #batch size 单独画图指定输入和两个输出目录：
+
+

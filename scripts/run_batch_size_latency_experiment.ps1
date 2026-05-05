@@ -1,13 +1,20 @@
 param(
-    [int]$TimeoutSec = 180
+    [int]$TimeoutSec = 180,
+    [int]$ExpectedRows = 120
 )
 
 $ErrorActionPreference = "Continue"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $srcDir = Join-Path $repoRoot "src"
-$logDir = Join-Path $repoRoot "test result\03_batch_size影响实验\logs"
+$mainScript = Join-Path $srcDir "main.py"
+$latencyDirName = "03_batch_size$([char]0x5F71)$([char]0x54CD)$([char]0x5B9E)$([char]0x9A8C)"
+$compareDirName = "02_batch_size$([char]0x5EF6)$([char]0x8FDF)$([char]0x5BF9)$([char]0x6BD4)"
+$latencyDir = Join-Path $repoRoot (Join-Path "test-result" $latencyDirName)
+$compareDir = Join-Path $repoRoot (Join-Path "test-result" $compareDirName)
+$logDir = Join-Path $latencyDir "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+New-Item -ItemType Directory -Force -Path $compareDir | Out-Null
 
 $batches = @(64, 32, 16, 4)
 $groups = @(
@@ -74,15 +81,15 @@ foreach ($run in $runs) {
     $stderr = Join-Path $logDir "$baseName.err.log"
 
     $argsList = @(
-        "main.py",
+        $mainScript,
         "-i"
     ) + $run.Inputs + @(
         "--device", "cuda",
         "--batch-size", [string]$run.Batch,
         "--no-frames",
-        "--no-video",
         "--display",
         "--perf-monitor",
+        "--no-video",
         "--record-lat",
         "--strategy", [string]$run.Strategy
     )
@@ -109,7 +116,7 @@ foreach ($run in $runs) {
         $exitCode = $null
     }
 
-    $latestCsv = Get-ChildItem (Join-Path $repoRoot "test result\03_batch_size影响实验") `
+    $latestCsv = Get-ChildItem $latencyDir `
         -Filter "latency_*.csv" `
         -File |
         Where-Object { $_.LastWriteTime -ge $start.AddSeconds(-1) } |
@@ -121,6 +128,13 @@ foreach ($run in $runs) {
         $rows = [Math]::Max(0, ((Get-Content $latestCsv.FullName | Measure-Object -Line).Lines - 1))
     }
 
+    $csvHeader = ""
+    $csvValid = $false
+    if ($latestCsv) {
+        $csvHeader = Get-Content $latestCsv.FullName -TotalCount 1
+        $csvValid = ($csvHeader -eq "idx,latency_ms" -and $rows -eq $ExpectedRows)
+    }
+
     $summary += [pscustomobject]@{
         Index = $idx
         Name = $run.Name
@@ -130,9 +144,11 @@ foreach ($run in $runs) {
         Seconds = $elapsed
         LatencyCsv = if ($latestCsv) { $latestCsv.FullName } else { "" }
         Rows = $rows
+        CsvHeader = $csvHeader
+        CsvValid = $csvValid
     }
 
-    Write-Host "[$idx/$($runs.Count)] $status exit=$exitCode seconds=$elapsed rows=$rows"
+    Write-Host "[$idx/$($runs.Count)] $status exit=$exitCode seconds=$elapsed rows=$rows csv_valid=$csvValid"
 }
 
 $summaryPath = Join-Path $logDir "experiment_summary.csv"
@@ -141,9 +157,10 @@ $summary | Format-Table Index,Name,Batch,Status,ExitCode,Seconds,Rows -AutoSize
 Write-Host "SUMMARY=$summaryPath"
 
 $plotScript = Join-Path $repoRoot "test\plot_latency_grid.py"
-$resultDir = Join-Path $repoRoot "test result\03_batch_size影响实验"
 Write-Host "Plotting latency grids..."
-python $plotScript --input-dir $resultDir --output-dir $resultDir
+python $plotScript --input-dir $latencyDir --output-dir $compareDir --output-dir $latencyDir
 if ($LASTEXITCODE -ne 0) {
     throw "Latency grid plotting failed with exit code $LASTEXITCODE"
 }
+
+exit 0

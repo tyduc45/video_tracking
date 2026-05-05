@@ -1,0 +1,16 @@
+﻿strategy=3
+exit_code=
+timed_out=True
+collection_error=
+duration_s=15.761
+collection_window_s=15
+steady_warmup_s=3
+baseline_gpu_total_mib=355
+peak_gpu_total_mib=355
+peak_gpu_total_delta_mib=660
+steady_avg_gpu_total_delta_mib=649.5
+peak_process_working_set_mib=632
+steady_avg_gpu_util_pct=294.5
+samples_csv=E:\cpp_review\video_object_search\test-result\显存占用对比\20260505_221525\strategy3\samples.csv
+stdout_log=E:\cpp_review\video_object_search\test-result\显存占用对比\20260505_221525\strategy3\stdout.log
+stderr_log=E:\cpp_review\video_object_search\test-result\显存占用对比\20260505_221525\strategy3\stderr.log

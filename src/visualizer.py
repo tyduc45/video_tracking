@@ -4,6 +4,7 @@
 
 import cv2
 import os
+import csv
 import logging
 import threading
 import time
@@ -254,6 +255,96 @@ class PolygonZone:
         cv2.putText(result, text, (min_x, max(min_y - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return result
+
+
+class FixedRegionCounter:
+    """固定双区域计数器，用于分辨率实验。"""
+
+    def __init__(self, output_dir: str, label: str, max_frames: int = 240):
+        self.output_dir = output_dir
+        self.label = label
+        self.max_frames = max_frames
+        self.count = 0
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_path = os.path.join(output_dir, f"{label}_region_counts.csv")
+        self.lock = threading.Lock()
+
+    def close(self):
+        with self.lock:
+            if self.csv_file:
+                self.csv_file.flush()
+                self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _ensure_writer(self):
+        if self.csv_writer is not None:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["idx", "远景小目标识别数", "近景识别数"])
+        self.csv_file.flush()
+
+    @staticmethod
+    def _regions(width: int, height: int) -> Dict[str, Tuple[int, int, int, int]]:
+        return {
+            "far": (0, 0, width // 2, height // 2),
+            "near": (0, height // 2, width, height),
+        }
+
+    @staticmethod
+    def _count_in_region(detections: list, region: Tuple[int, int, int, int]) -> int:
+        x1, y1, x2, y2 = region
+        total = 0
+        for det in detections or []:
+            if not isinstance(det, dict):
+                continue
+            bbox = det.get("bbox", [])
+            if len(bbox) < 4:
+                continue
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            if x1 <= cx < x2 and y1 <= cy < y2:
+                total += 1
+        return total
+
+    def process(self, frame: np.ndarray, detections: list) -> Tuple[np.ndarray, bool]:
+        """绘制区域、写入CSV，返回处理后的帧和是否达到上限。"""
+        h, w = frame.shape[:2]
+        regions = self._regions(w, h)
+        far_count = self._count_in_region(detections, regions["far"])
+        near_count = self._count_in_region(detections, regions["near"])
+
+        with self.lock:
+            if self.count >= self.max_frames:
+                return frame, True
+            self._ensure_writer()
+            self.count += 1
+            idx = self.count
+            self.csv_writer.writerow([idx, far_count, near_count])
+            self.csv_file.flush()
+            reached_limit = self.count >= self.max_frames
+
+        result = frame.copy()
+        self._draw_region(result, regions["far"], "Far small targets", far_count, (255, 180, 0))
+        self._draw_region(result, regions["near"], "Near targets", near_count, (0, 220, 255))
+        cv2.putText(result, f"Sample: {idx}/{self.max_frames}", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        return result, reached_limit
+
+    @staticmethod
+    def _draw_region(frame: np.ndarray, region: Tuple[int, int, int, int],
+                     label: str, count: int, color: Tuple[int, int, int]):
+        x1, y1, x2, y2 = region
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        text_y = max(y1 + 30, 30)
+        cv2.putText(frame, f"{label}: {count}", (x1 + 10, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 
 class RealtimeDisplay:
@@ -713,7 +804,10 @@ class PipelineOutputHandler:
                  fps: float = 30.0,
                  realtime_display: bool = False,
                  window_width: int = 1280,
-                 window_height: int = 720):
+                 window_height: int = 720,
+                 region_count: bool = False,
+                 region_label: str = "resolution",
+                 region_max_frames: int = 240):
         self.output_dir = output_dir
         self.save_frames = save_frames
         self.save_video = save_video
@@ -727,9 +821,15 @@ class PipelineOutputHandler:
         self.trajectory_point_expire_timeout = trajectory_point_expire_timeout
         self.fps = fps
         self.realtime_display = realtime_display
+        self.region_count = region_count
+        self.region_stop_event = None
 
         self.frame_info = {}
         self.video_generator = VideoGenerator(fps=fps)
+        self.region_counter = (
+            FixedRegionCounter(output_dir, region_label, region_max_frames)
+            if region_count else None
+        )
 
         # 初始化 supervision 注解器
         self._init_annotators()
@@ -747,6 +847,10 @@ class PipelineOutputHandler:
                 window_height=window_height
             )
             self.display.start()
+
+    def set_stop_event(self, stop_event: threading.Event):
+        """设置区域实验达到帧数上限时要触发的停止事件。"""
+        self.region_stop_event = stop_event
 
     def _init_annotators(self):
         """初始化 supervision 注解器"""
@@ -809,6 +913,13 @@ class PipelineOutputHandler:
                 polygon_zone.update(frame_data.detections or [])
                 output_frame = polygon_zone.draw(output_frame)
 
+            if self.region_counter is not None:
+                output_frame, reached_limit = self.region_counter.process(
+                    output_frame, frame_data.detections or []
+                )
+                if reached_limit and self.region_stop_event is not None:
+                    self.region_stop_event.set()
+
             frame_info_text = f"{frame_data.video_id} Frame: {frame_data.frame_id}"
             cv2.putText(output_frame, frame_info_text, (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -833,6 +944,8 @@ class PipelineOutputHandler:
         """停止实时显示"""
         if self.display:
             self.display.stop()
+        if self.region_counter is not None:
+            self.region_counter.close()
 
     def is_display_active(self) -> bool:
         """检查显示窗口是否仍然活跃"""
@@ -1020,7 +1133,10 @@ class PipelineOutputHandler:
 
 def create_output_handler(config, realtime_display: bool = False,
                           window_width: int = 1280,
-                          window_height: int = 720) -> PipelineOutputHandler:
+                          window_height: int = 720,
+                          region_count: bool = False,
+                          region_label: str = "resolution",
+                          region_max_frames: int = 240) -> PipelineOutputHandler:
     """根据配置创建输出处理器"""
     return PipelineOutputHandler(
         output_dir=config.output_dir,
@@ -1038,4 +1154,7 @@ def create_output_handler(config, realtime_display: bool = False,
         realtime_display=realtime_display,
         window_width=window_width,
         window_height=window_height,
+        region_count=region_count,
+        region_label=region_label,
+        region_max_frames=region_max_frames,
     )

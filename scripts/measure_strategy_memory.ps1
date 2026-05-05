@@ -14,7 +14,8 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $SrcDir = Join-Path $RepoRoot "src"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$OutRoot = Join-Path $RepoRoot "result\memory_probe\$Timestamp"
+$MemoryDirName = "$([char]0x663E)$([char]0x5B58)$([char]0x5360)$([char]0x7528)$([char]0x5BF9)$([char]0x6BD4)"
+$OutRoot = Join-Path $RepoRoot (Join-Path (Join-Path "test-result" $MemoryDirName) $Timestamp)
 New-Item -ItemType Directory -Force -Path $OutRoot | Out-Null
 
 # Keep the experiment order fixed so repeated runs are comparable.

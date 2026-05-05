@@ -1,0 +1,16 @@
+﻿Experiment order: strategy 2 -> strategy 3
+Collection window: 15s per strategy
+Warmup excluded from steady averages: first 3s
+
+Key evidence for the paper/report:
+strategy2_peak_gpu_total_delta_mib=682
+strategy3_peak_gpu_total_delta_mib=660
+peak_gpu_total_delta_difference_mib(strategy2-strategy3)=22
+
+strategy2_steady_avg_gpu_total_delta_mib=671.9
+strategy3_steady_avg_gpu_total_delta_mib=649.5
+steady_avg_gpu_total_delta_difference_mib(strategy2-strategy3)=22.4
+steady_avg_gpu_total_delta_ratio(strategy2/strategy3)=1.03
+
+Interpretation:
+If strategy2 values are higher, that supports the claim that per-video YOLO/TensorRT instances duplicate GPU-resident resources, while strategy3 centralizes multi-stream inference into one batched instance.

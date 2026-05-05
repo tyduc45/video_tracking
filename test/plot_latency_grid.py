@@ -16,7 +16,11 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULT_DIR = PROJECT_ROOT / "test result" / "03_batch_size影响实验"
+DEFAULT_RESULT_DIR = PROJECT_ROOT / "test-result" / "03_batch_size影响实验"
+DEFAULT_OUTPUT_DIRS = [
+    PROJECT_ROOT / "test-result" / "02_batch_size延迟对比",
+    PROJECT_ROOT / "test-result" / "03_batch_size影响实验",
+]
 
 FILENAME_RE = re.compile(
     r"^latency_source(?P<videos>\d+)_bs(?P<batch>\d+)_(?P<strategy>.+?)_"
@@ -142,14 +146,20 @@ def plot_strategy_grid(strategy: str, runs: list[LatencyRun], output_dir: Path) 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Plot latency grids from record-lat CSV files.")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_RESULT_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_RESULT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        action="append",
+        default=None,
+        help="Output directory for generated PNGs. Repeat to write to multiple directories.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     input_dir = args.input_dir
-    output_dir = args.output_dir
+    output_dirs = args.output_dir or DEFAULT_OUTPUT_DIRS
 
     latest = discover_latest_runs(input_dir)
     if not latest:
@@ -161,8 +171,9 @@ def main() -> int:
         by_strategy.setdefault(run.strategy, []).append(run)
 
     for strategy in sorted(by_strategy):
-        output_path = plot_strategy_grid(strategy, by_strategy[strategy], output_dir)
-        print(f"Wrote {output_path}")
+        for output_dir in output_dirs:
+            output_path = plot_strategy_grid(strategy, by_strategy[strategy], output_dir)
+            print(f"Wrote {output_path}")
 
     return 0
 

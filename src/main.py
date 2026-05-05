@@ -149,6 +149,12 @@ def main():
                        help='启用性能监控窗口')
     parser.add_argument('--record-lat', action='store_true',
                        help='记录单帧处理延迟到CSV，采集120帧后自动停止')
+    parser.add_argument('--region-count', action='store_true',
+                       help='启用分辨率实验双区域计数CSV和视频标注')
+    parser.add_argument('--region-label', type=str, default=None,
+                       help='区域计数输出文件名前缀')
+    parser.add_argument('--region-max-frames', type=int, default=240,
+                       help='区域计数采集帧数上限')
     parser.add_argument('--strategy', type=normalize_strategy, default=3,
                        help='处理策略: 1/heap-reord=乱序竞争批处理, 2/para=独立流水线, 3/batch-distrib=当前批处理(默认)')
 
@@ -215,7 +221,10 @@ def _create_output_handler_and_monitor(config, args, num_videos):
         config,
         realtime_display=realtime_display,
         window_width=display_width,
-        window_height=display_height
+        window_height=display_height,
+        region_count=getattr(args, 'region_count', False),
+        region_label=getattr(args, 'region_label', None) or f"imgsz{config.imgsz}",
+        region_max_frames=getattr(args, 'region_max_frames', 240),
     )
 
     if realtime_display:
@@ -225,7 +234,7 @@ def _create_output_handler_and_monitor(config, args, num_videos):
     perf_monitor_enabled = getattr(args, 'perf_monitor', False)
     strategy_name = STRATEGY_NAMES[getattr(args, 'strategy', 3)]
     config_title = f"source{num_videos}_bs{args.batch_size}_{strategy_name}"
-    record_dir = Path(__file__).resolve().parents[1] / "test result" / "03_batch_size影响实验"
+    record_dir = Path(__file__).resolve().parents[1] / "test-result" / "03_batch_size影响实验"
     record_latency = getattr(args, 'record_lat', False)
     perf_monitor = PerformanceMonitor(
         num_videos=num_videos,
@@ -334,6 +343,7 @@ def run_chaotic_mode(config, video_sources, args):
         queue_size=200,
     )
     perf_monitor.set_stop_event(pipeline.stop_event)
+    output_handler.set_stop_event(pipeline.stop_event)
 
     global _global_stop_event
     _global_stop_event = pipeline.stop_event
@@ -415,6 +425,7 @@ def run_independent_mode(config, video_sources, args):
         queue_size=200,
     )
     perf_monitor.set_stop_event(pipeline.stop_event)
+    output_handler.set_stop_event(pipeline.stop_event)
 
     global _global_stop_event
     _global_stop_event = pipeline.stop_event
@@ -512,6 +523,7 @@ def run_batch_mode(config, video_sources, args):
         queue_size=200
     )
     perf_monitor.set_stop_event(pipeline.stop_event)
+    output_handler.set_stop_event(pipeline.stop_event)
 
     # 设置全局停止事件
     global _global_stop_event
